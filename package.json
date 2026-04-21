@@ -1,7 +1,7 @@
 {
   "name": "smart-connections-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for Obsidian Smart Connections - enables semantic search and knowledge graph queries",
+  "version": "2.0.0",
+  "description": "MCP server for Obsidian Smart Connections — block-level semantic search, Ollama-backed queries, hot reload.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -11,7 +11,9 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "dev": "tsc && node dist/index.js",
+    "prepublishOnly": "tsc",
+    "smoke": "tsc && node test-bge-m3.mjs"
   },
   "keywords": [
     "mcp",
