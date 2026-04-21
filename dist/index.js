@@ -9,24 +9,31 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { loadDotEnv } from './env-loader.js';
 import { SmartConnectionsLoader } from './smart-connections-loader.js';
 import { SearchEngine } from './search-engine.js';
-// Environment variable for vault path
+// Load a .env file next to the process cwd (optional). Values already set
+// via the MCP client config win — see env-loader.ts.
+const dotenv = loadDotEnv();
+if (dotenv.loaded) {
+    console.error(`[smart-connections-mcp] loaded .env from ${dotenv.path} (${dotenv.keys.length} new vars)`);
+}
 const VAULT_PATH = process.env.SMART_VAULT_PATH;
 if (!VAULT_PATH) {
-    console.error('Error: SMART_VAULT_PATH environment variable is required');
-    console.error('Please set it to your Obsidian vault path, e.g.:');
-    console.error('  export SMART_VAULT_PATH="/Users/username/My Vault"');
+    console.error('Error: SMART_VAULT_PATH environment variable is required.');
+    console.error('Set it via the MCP client config (env) or in a .env file next to the server cwd.');
+    console.error('Example: SMART_VAULT_PATH="/Users/username/My Vault"');
     process.exit(1);
 }
-// Initialize loader
+const VAULT_NAME = process.env.SMART_VAULT_NAME?.trim() || // explicit override wins
+    (VAULT_PATH.split('/').filter(Boolean).pop() ?? 'vault');
 const loader = new SmartConnectionsLoader(VAULT_PATH);
 await loader.initialize();
-// Create search engine after loader is initialized
 const searchEngine = new SearchEngine(loader);
-console.error('Smart Connections MCP Server initialized successfully');
-console.error(`Vault: ${VAULT_PATH}`);
-console.error(`Loaded ${loader.getSources().size} notes`);
+const activeModel = loader.getActiveModel();
+console.error(`[smart-connections-mcp] ready — vault="${VAULT_NAME}" path="${VAULT_PATH}" ` +
+    `model="${activeModel.model_key}" dims=${activeModel.dims} ` +
+    `sources=${loader.getSources().size}`);
 // Create MCP server
 const server = new Server({
     name: 'smart-connections-mcp',

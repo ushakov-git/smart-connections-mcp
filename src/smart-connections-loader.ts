@@ -1,195 +1,346 @@
 /**
- * Loader for Smart Connections data from .smart-env directory
+ * Loader for Smart Connections data from the `.smart-env` directory.
+ *
+ * Responsibilities:
+ *   1. Read `smart_env.json`.
+ *   2. Read `embedding_models/embedding_models.ajson` (new format).
+ *   3. Resolve the *active* embedding model key using the priority:
+ *        env SMART_EMBED_MODEL_KEY  →  smart_env.json `embedding_models.default_model_key`
+ *                                   →  autodetect most-frequent key in sources
+ *   4. Load `multi/*.ajson`, keeping only `smart_sources:` entries that
+ *      actually carry a vector under the active model. Everything else is
+ *      skipped and counted (diagnostics only).
+ *   5. Detect the true embedding dimension from the first non-empty vec —
+ *      metadata `dims` in the plugin is known to lie (e.g. bge-m3 is 1024
+ *      but the plugin records 384).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { SmartSource, SmartEnvConfig } from './types.js';
+import type { SmartSource, SmartEnvConfig, ActiveModel } from './types.js';
+import { parseAjsonLines } from './ajson-parser.js';
+import { EmbeddingModelsLoader } from './embedding-models-loader.js';
+
+export interface LoadStats {
+  sourceFilesScanned: number;
+  sourcesKept: number;
+  sourcesReplaced: number;
+  sourcesSkippedNoEmbedding: number;
+  sourcesSkippedNullPath: number;
+  parseErrors: number;
+}
 
 export class SmartConnectionsLoader {
   private vaultPath: string;
   private smartEnvPath: string;
   private config: SmartEnvConfig | null = null;
   private sources: Map<string, SmartSource> = new Map();
+  private embeddingModels: EmbeddingModelsLoader;
+  private active: ActiveModel | null = null;
+  private stats: LoadStats = {
+    sourceFilesScanned: 0,
+    sourcesKept: 0,
+    sourcesReplaced: 0,
+    sourcesSkippedNoEmbedding: 0,
+    sourcesSkippedNullPath: 0,
+    parseErrors: 0,
+  };
 
   constructor(vaultPath: string) {
-    this.vaultPath = vaultPath;
-    this.smartEnvPath = path.join(vaultPath, '.smart-env');
+    this.vaultPath = path.resolve(vaultPath);
+    this.smartEnvPath = path.join(this.vaultPath, '.smart-env');
+    this.embeddingModels = new EmbeddingModelsLoader(this.smartEnvPath);
   }
 
-  /**
-   * Initialize and load all Smart Connections data
-   */
   async initialize(): Promise<void> {
-    // Check if .smart-env exists
     if (!fs.existsSync(this.smartEnvPath)) {
       throw new Error(`Smart Connections directory not found at: ${this.smartEnvPath}`);
     }
-
-    // Load configuration
-    await this.loadConfig();
-
-    // Load all sources
-    await this.loadSources();
+    this.loadConfig();
+    this.embeddingModels.load();
+    this.active = this.resolveActiveModel();
+    this.loadSources();
+    this.finalizeDims();
+    this.logStartupDiagnostics();
   }
 
-  /**
-   * Load smart_env.json configuration
-   */
-  private async loadConfig(): Promise<void> {
-    const configPath = path.join(this.smartEnvPath, 'smart_env.json');
+  // ------------------------------------------------------------- config
 
+  private loadConfig(): void {
+    const configPath = path.join(this.smartEnvPath, 'smart_env.json');
     if (!fs.existsSync(configPath)) {
       throw new Error(`Configuration file not found at: ${configPath}`);
     }
+    this.config = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as SmartEnvConfig;
+  }
 
-    const configData = fs.readFileSync(configPath, 'utf-8');
-    this.config = JSON.parse(configData);
+  // --------------------------------------------------------- model resolve
+
+  /**
+   * Priority:
+   *   1. env SMART_EMBED_MODEL_KEY (accepts full key `provider#ts` or bare `model_key`)
+   *   2. smart_env.json `embedding_models.default_model_key`
+   *   3. autodetect — scan first ~20 source files, pick the most common
+   *      embedding key observed in source entries.
+   *
+   * No legacy fallback to `smart_sources.embed_model` — the new-format
+   * plugin leaves that field stale and it is actively misleading.
+   */
+  private resolveActiveModel(): ActiveModel {
+    const envHint = process.env.SMART_EMBED_MODEL_KEY?.trim();
+    if (envHint) {
+      const fromEnv = this.buildActiveFromHint(envHint, 'env-override');
+      if (fromEnv) return fromEnv;
+      throw new Error(
+        `SMART_EMBED_MODEL_KEY="${envHint}" did not match any entry in embedding_models.ajson ` +
+          `and is not a known model_key. Check available models via embedding_models.ajson.`,
+      );
+    }
+
+    const defaultKey = this.config?.embedding_models?.default_model_key;
+    if (defaultKey) {
+      const fromDefault = this.buildActiveFromHint(defaultKey, 'default-model-key');
+      if (fromDefault) return fromDefault;
+    }
+
+    const autodetected = this.autodetectActiveModel();
+    if (autodetected) return autodetected;
+
+    throw new Error(
+      'Could not resolve active embedding model. Set SMART_EMBED_MODEL_KEY or ensure ' +
+        '.smart-env/smart_env.json has embedding_models.default_model_key pointing at a ' +
+        'valid entry in embedding_models/embedding_models.ajson.',
+    );
+  }
+
+  private buildActiveFromHint(hint: string, resolution: ActiveModel['resolution']): ActiveModel | null {
+    const record = this.embeddingModels.resolve(hint);
+    if (record) {
+      return {
+        model_key: record.model_key,
+        provider_key: record.provider_key,
+        full_key: record.key,
+        dims: 0, // filled after first vec is seen
+        host: record.host,
+        endpoint: record.endpoint,
+        resolution,
+      };
+    }
+    // No entry in embedding_models.ajson — allow raw model_key as-is.
+    return {
+      model_key: hint,
+      provider_key: '',
+      full_key: '',
+      dims: 0,
+      resolution,
+    };
   }
 
   /**
-   * Load all .ajson files from the multi directory
+   * Scan up to N `.ajson` files and count the most frequently used embedding
+   * key across `smart_sources:*.embeddings`. Tie-break: first seen wins.
    */
-  private async loadSources(): Promise<void> {
+  private autodetectActiveModel(): ActiveModel | null {
     const multiPath = path.join(this.smartEnvPath, 'multi');
+    if (!fs.existsSync(multiPath)) return null;
 
+    const files = fs.readdirSync(multiPath).filter((f) => f.endsWith('.ajson')).slice(0, 20);
+    const counts = new Map<string, number>();
+
+    for (const file of files) {
+      const content = fs.readFileSync(path.join(multiPath, file), 'utf-8');
+      parseAjsonLines(content, (key, value) => {
+        if (!key.startsWith('smart_sources:')) return;
+        const src = value as Partial<SmartSource> | null;
+        if (!src?.embeddings) return;
+        for (const embKey of Object.keys(src.embeddings)) {
+          counts.set(embKey, (counts.get(embKey) ?? 0) + 1);
+        }
+      });
+    }
+
+    if (counts.size === 0) return null;
+
+    let best: string | null = null;
+    let bestCount = -1;
+    for (const [k, c] of counts) {
+      if (c > bestCount) {
+        bestCount = c;
+        best = k;
+      }
+    }
+    if (!best) return null;
+
+    const record = this.embeddingModels.resolve(best);
+    return {
+      model_key: best,
+      provider_key: record?.provider_key ?? '',
+      full_key: record?.key ?? '',
+      dims: 0,
+      host: record?.host,
+      endpoint: record?.endpoint,
+      resolution: 'autodetect-sources',
+    };
+  }
+
+  // --------------------------------------------------------- sources
+
+  private loadSources(): void {
+    const multiPath = path.join(this.smartEnvPath, 'multi');
     if (!fs.existsSync(multiPath)) {
       throw new Error(`Multi directory not found at: ${multiPath}`);
     }
+    if (!this.active) throw new Error('loadSources called before resolveActiveModel');
 
-    const files = fs.readdirSync(multiPath);
-    const ajsonFiles = files.filter(f => f.endsWith('.ajson'));
+    const files = fs.readdirSync(multiPath).filter((f) => f.endsWith('.ajson'));
+    this.stats.sourceFilesScanned = files.length;
 
-    console.error(`Loading ${ajsonFiles.length} source files...`);
-
-    for (const file of ajsonFiles) {
-      try {
-        const filePath = path.join(multiPath, file);
-        const content = fs.readFileSync(filePath, 'utf-8');
-
-        // Parse the AJSON format (JSONL - one JSON object per line)
-        // Each line is a single object like: "key": {...}
-        const lines = content.trim().split('\n');
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-
-          try {
-            // Each line is formatted as: "key1": {...}, "key2": {...}, "key3": {...},
-            // Remove trailing comma and wrap with curly braces to make valid JSON
-            const cleanedLine = line.replace(/,\s*$/, '');
-            const obj = JSON.parse(`{${cleanedLine}}`);
-
-            // Process all key-value pairs in the object
-            for (const key of Object.keys(obj)) {
-              // Only process smart_sources entries (not smart_blocks)
-              if (key.startsWith('smart_sources:')) {
-                const sourceData: SmartSource = obj[key];
-                // Skip entries with null/undefined paths
-                if (sourceData && sourceData.path) {
-                  this.sources.set(sourceData.path, sourceData);
-                }
-              }
-            }
-          } catch (parseError) {
-            // Skip lines that can't be parsed
-            console.error(`Parse error in ${file}:`, parseError);
+    for (const file of files) {
+      const filePath = path.join(multiPath, file);
+      const content = fs.readFileSync(filePath, 'utf-8');
+      parseAjsonLines(
+        content,
+        (key, value) => {
+          if (!key.startsWith('smart_sources:')) return;
+          const src = value as SmartSource | null;
+          if (!src) return;
+          if (!src.path) {
+            this.stats.sourcesSkippedNullPath += 1;
+            return;
           }
-        }
-      } catch (error) {
-        console.error(`Error loading ${file}:`, error);
-      }
+          const vec = src.embeddings?.[this.active!.model_key]?.vec;
+          if (!Array.isArray(vec) || vec.length === 0) {
+            this.stats.sourcesSkippedNoEmbedding += 1;
+            return;
+          }
+          if (this.sources.has(src.path)) {
+            this.stats.sourcesReplaced += 1;
+          } else {
+            this.stats.sourcesKept += 1;
+          }
+          this.sources.set(src.path, src);
+        },
+        {
+          onError: () => {
+            this.stats.parseErrors += 1;
+          },
+        },
+      );
     }
-
-    console.error(`Loaded ${this.sources.size} sources successfully`);
   }
 
-  /**
-   * Get all sources
-   */
+  private finalizeDims(): void {
+    if (!this.active) return;
+    for (const src of this.sources.values()) {
+      const vec = src.embeddings?.[this.active.model_key]?.vec;
+      if (Array.isArray(vec) && vec.length > 0) {
+        this.active.dims = vec.length;
+        return;
+      }
+    }
+  }
+
+  // --------------------------------------------------------- diagnostics
+
+  private logStartupDiagnostics(): void {
+    const a = this.active!;
+    const s = this.stats;
+    console.error(
+      `[smart-connections-mcp] active model: model_key="${a.model_key}" ` +
+        `provider="${a.provider_key || 'n/a'}" full_key="${a.full_key || 'n/a'}" ` +
+        `dims=${a.dims} resolution=${a.resolution}`,
+    );
+    console.error(
+      `[smart-connections-mcp] sources: ${s.sourcesKept} kept / ${s.sourcesReplaced} replaced / ` +
+        `${s.sourcesSkippedNoEmbedding} no-embedding / ${s.sourcesSkippedNullPath} null-path / ` +
+        `${s.parseErrors} parse-errors (from ${s.sourceFilesScanned} .ajson files)`,
+    );
+    if (s.sourcesKept === 0) {
+      console.error(
+        `[smart-connections-mcp] WARNING: 0 sources matched active model "${a.model_key}". ` +
+          `Available model_keys observed in vault may differ — check embedding_models.ajson ` +
+          `or set SMART_EMBED_MODEL_KEY.`,
+      );
+    }
+  }
+
+  // --------------------------------------------------------- accessors
+
   getSources(): Map<string, SmartSource> {
     return this.sources;
   }
 
-  /**
-   * Get a specific source by path
-   */
   getSource(notePath: string): SmartSource | undefined {
     return this.sources.get(notePath);
   }
 
-  /**
-   * Get configuration
-   */
   getConfig(): SmartEnvConfig | null {
     return this.config;
   }
 
-  /**
-   * Get the embedding model key from config
-   */
-  getEmbeddingModelKey(): string {
-    if (!this.config) {
-      throw new Error('Configuration not loaded');
-    }
-
-    // Extract the model key from the embed_model configuration
-    const embedModel = this.config.smart_sources.embed_model;
-    const adapter = embedModel.adapter;
-
-    // The actual model key is nested in the adapter configuration
-    // e.g., embed_model.transformers.model_key = "TaylorAI/bge-micro-v2"
-    if (adapter && embedModel[adapter] && typeof embedModel[adapter] === 'object') {
-      const adapterConfig = embedModel[adapter] as any;
-      if (adapterConfig.model_key) {
-        return adapterConfig.model_key;
-      }
-    }
-
-    // Fallback: find first object key that's not 'adapter'
-    const modelKeys = Object.keys(embedModel).filter(k => k !== 'adapter' && typeof embedModel[k] === 'object');
-
-    if (modelKeys.length === 0) {
-      throw new Error('No embedding model found in configuration');
-    }
-
-    return modelKeys[0];
+  getActiveModel(): ActiveModel {
+    if (!this.active) throw new Error('Active model not resolved yet — call initialize() first');
+    return this.active;
   }
 
-  /**
-   * Get vault path
-   */
+  /** @deprecated Kept for compatibility during migration; prefer getActiveModel().model_key. */
+  getEmbeddingModelKey(): string {
+    return this.getActiveModel().model_key;
+  }
+
   getVaultPath(): string {
     return this.vaultPath;
   }
 
-  /**
-   * Read the actual markdown content of a note
-   */
-  readNoteContent(notePath: string): string {
-    const fullPath = path.join(this.vaultPath, notePath);
-
-    if (!fs.existsSync(fullPath)) {
-      throw new Error(`Note not found at: ${fullPath}`);
-    }
-
-    return fs.readFileSync(fullPath, 'utf-8');
+  getLoadStats(): LoadStats {
+    return { ...this.stats };
   }
 
   /**
-   * Extract content for specific blocks/sections
+   * Read a markdown note's content. `notePath` is vault-relative.
+   * Path-traversal containment is enforced: the resolved target must lie
+   * strictly within the vault root (symlinks resolved).
    */
+  readNoteContent(notePath: string): string {
+    const full = this.resolveInsideVault(notePath);
+    return fs.readFileSync(full, 'utf-8');
+  }
+
   extractBlockContent(notePath: string, blockHeading: string): string {
     const content = this.readNoteContent(notePath);
     const source = this.getSource(notePath);
-
-    if (!source || !source.blocks[blockHeading]) {
-      return '';
-    }
-
-    const [startLine, endLine] = source.blocks[blockHeading];
+    const range = source?.blocks?.[blockHeading];
+    if (!range) return '';
+    const [startLine, endLine] = range;
     const lines = content.split('\n');
-
     return lines.slice(startLine - 1, endLine).join('\n');
+  }
+
+  /**
+   * Join `notePath` onto the vault root and assert containment. Rejects
+   * absolute paths, `..` escapes, and symlinks that point outside.
+   */
+  private resolveInsideVault(notePath: string): string {
+    if (typeof notePath !== 'string' || notePath.length === 0) {
+      throw new Error('notePath must be a non-empty string');
+    }
+    if (path.isAbsolute(notePath)) {
+      throw new Error('notePath must be vault-relative, not absolute');
+    }
+    const joined = path.resolve(this.vaultPath, notePath);
+    const base = path.resolve(this.vaultPath) + path.sep;
+    if (joined !== path.resolve(this.vaultPath) && !joined.startsWith(base)) {
+      throw new Error('Path escapes vault root');
+    }
+    if (!fs.existsSync(joined)) {
+      throw new Error(`Note not found at: ${joined}`);
+    }
+    // Follow symlinks and re-check — defeats symlink-escape tricks.
+    const real = fs.realpathSync(joined);
+    const realBase = fs.realpathSync(this.vaultPath) + path.sep;
+    if (real !== fs.realpathSync(this.vaultPath) && !real.startsWith(realBase)) {
+      throw new Error('Resolved path escapes vault root');
+    }
+    return real;
   }
 }

@@ -1,0 +1,77 @@
+/**
+ * Loader for .smart-env/embedding_models/embedding_models.ajson.
+ *
+ * This file is authored by recent versions of the Obsidian Smart
+ * Connections plugin and contains one entry per registered embedding
+ * model, keyed `embedding_models:<provider>#<timestamp>`.
+ *
+ * Example entry:
+ *   "embedding_models:ollama#1776670752600": {
+ *     "provider_key": "ollama",
+ *     "model_key": "bge-m3:latest",
+ *     "dims": 384,                 // may LIE — we detect from vectors
+ *     "host": "http://localhost:11434",
+ *     "endpoint": "/api/embed",
+ *     "key": "ollama#1776670752600",
+ *     ...
+ *   }
+ *
+ * We index these by the full `embedding_models:*` key, by the short
+ * `provider#ts` key, and by `model_key` to support flexible lookups.
+ */
+import * as fs from 'fs';
+import * as path from 'path';
+import { parseAjsonLines } from './ajson-parser.js';
+export class EmbeddingModelsLoader {
+    smartEnvPath;
+    /** Indexed by full provider#ts key. */
+    byFullKey = new Map();
+    /** Indexed by model_key (last-writer-wins if duplicates — rare). */
+    byModelKey = new Map();
+    constructor(smartEnvPath) {
+        this.smartEnvPath = smartEnvPath;
+    }
+    load() {
+        const filePath = path.join(this.smartEnvPath, 'embedding_models', 'embedding_models.ajson');
+        if (!fs.existsSync(filePath))
+            return; // older plugin layout — soft-fail
+        const content = fs.readFileSync(filePath, 'utf-8');
+        parseAjsonLines(content, (key, value) => {
+            if (!key.startsWith('embedding_models:'))
+                return;
+            if (!value || typeof value !== 'object')
+                return;
+            const data = value;
+            const shortKey = typeof data.key === 'string'
+                ? data.key
+                : key.slice('embedding_models:'.length);
+            const providerKey = typeof data.provider_key === 'string' ? data.provider_key : '';
+            const modelKey = typeof data.model_key === 'string' ? data.model_key : '';
+            if (!modelKey)
+                return;
+            const record = {
+                key: shortKey,
+                provider_key: providerKey,
+                model_key: modelKey,
+                dims: typeof data.dims === 'number' ? data.dims : undefined,
+                host: typeof data.host === 'string' ? data.host : undefined,
+                endpoint: typeof data.endpoint === 'string' ? data.endpoint : undefined,
+                max_tokens: typeof data.max_tokens === 'number' ? data.max_tokens : undefined,
+                raw: data,
+            };
+            this.byFullKey.set(shortKey, record);
+            this.byModelKey.set(modelKey, record);
+        }, { onError: (line, err) => console.error('embedding_models parse error:', err, line.slice(0, 120)) });
+    }
+    /** Accepts either the short full-key (`provider#ts`) or a bare `model_key`. */
+    resolve(hint) {
+        return this.byFullKey.get(hint) ?? this.byModelKey.get(hint);
+    }
+    all() {
+        return Array.from(this.byFullKey.values());
+    }
+    isEmpty() {
+        return this.byFullKey.size === 0;
+    }
+}
+//# sourceMappingURL=embedding-models-loader.js.map

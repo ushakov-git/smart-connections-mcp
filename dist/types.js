@@ -1,5 +1,5 @@
 /**
- * Type definitions for Smart Connections MCP Server
+ * Type definitions for Smart Connections MCP Server.
  */
 export {};
 //# sourceMappingURL=types.js.map
