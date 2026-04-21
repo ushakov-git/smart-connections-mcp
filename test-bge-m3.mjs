@@ -200,6 +200,33 @@ if (health.reachable && health.modelAvailable && health.dimsMatch) {
   await probe.embed('повторяющийся запрос');
   const warm = Date.now() - t2;
   ok('ollama LRU cache speeds up repeated query', warm < cold, `cold=${cold}ms warm=${warm}ms`);
+
+  // Weighted-fusion tilt: with keyword-heavy weights, a short ambiguous
+  // query should be more keyword-driven; with semantic-heavy weights it
+  // should be more semantically coherent. We can't assert "better" in a
+  // unit-test sense, but we can assert that the two configurations
+  // produce *different* rankings, proving the weights actually do work.
+  const engineSemHeavy = new SearchEngine(loader, VAULT_NAME, probe, {
+    semantic_weight: 0.95, keyword_weight: 0.05, k: 60,
+  });
+  const engineKwHeavy = new SearchEngine(loader, VAULT_NAME, probe, {
+    semantic_weight: 0.05, keyword_weight: 0.95, k: 60,
+  });
+  const query = 'observability и трейсинг агентов Mastra';
+  const semHeavy = await engineSemHeavy.searchByQuery(query, { mode: 'hybrid', limit: 20, threshold: 0 });
+  const kwHeavy = await engineKwHeavy.searchByQuery(query, { mode: 'hybrid', limit: 20, threshold: 0 });
+  // At different weight settings the fused scores must change — the top-1
+  // may coincide when a single item is strong in both lists, but scores and
+  // the tail of the ranking cannot be identical unless a weight has no effect.
+  const semScores = semHeavy.results.map((h) => h.similarity).join(',');
+  const kwScores = kwHeavy.results.map((h) => h.similarity).join(',');
+  ok('weighted fusion: scores differ when weights differ', semScores !== kwScores,
+     `sem_top_score=${semHeavy.results[0]?.similarity?.toFixed(5)} kw_top_score=${kwHeavy.results[0]?.similarity?.toFixed(5)}`);
+  ok('fusion config exposed via getFusionConfig', engineSemHeavy.getFusionConfig().semantic_weight === 0.95);
+
+  // k parameter plumbing.
+  const engineK75 = new SearchEngine(loader, VAULT_NAME, probe, { k: 75 });
+  ok('fusion k is configurable', engineK75.getFusionConfig().k === 75);
 } else {
   console.log('[SKIP] ollama-backed semantic tests (host unreachable or dims mismatch)');
 }

@@ -1,4 +1,27 @@
+
 # Changelog
+
+## v2.1.0 — 2026-04-22
+
+Incremental. No breaking changes.
+
+- **Weighted hybrid RRF.** Hybrid `search_notes` now uses
+    `score(doc) = w_sem · rrf_sem(doc) + w_kw · rrf_kw(doc)`.
+  Defaults `w_sem = 0.7`, `w_kw = 0.3` tilt results toward the
+  embedding ranking by default — the keyword list still contributes
+  as a safety net for rare names, quotations and acronyms.
+- **Configurable RRF.** New env vars `RRF_K` (smoothing, default 60),
+  `RRF_SEMANTIC_WEIGHT` (0.7), `RRF_KEYWORD_WEIGHT` (0.3). The
+  *k*-parameter is a smoothing constant applied symmetrically to
+  both lists, so changing *k* alone does **not** shift the
+  semantic/keyword balance — the weights are the real lever.
+- **Meta exposes fusion.** Every response's `meta` now carries
+  `fusion: { k, semantic_weight, keyword_weight }` so an agent (or
+  operator) can see which config produced the ranking.
+- **Docs.** README.md / README_rus.md updated with the env table
+  entries and an explicit note that *k* doesn't shift balance.
+- **`.mcp.json` template** committed into the reference vault as a
+  copy-paste starting point for new vaults.
 
 ## v2.0.0 — 2026-04-21
 

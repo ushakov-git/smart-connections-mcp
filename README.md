@@ -58,6 +58,9 @@ Register a separate MCP server per vault. `SMART_VAULT_NAME` is echoed in every 
 | `OLLAMA_EMBED_MODEL` | Model name Ollama should use. | active `model_key` |
 | `DISABLE_SEMANTIC_SEARCH` | `1` to skip Ollama even if configured. | unset |
 | `DISABLE_WATCHER` | `1` to skip the filesystem watcher. | unset |
+| `RRF_K` | Smoothing constant for hybrid RRF. Applied to both lists, so changing it does **not** shift the semantic/keyword balance — it only flattens the score curve. | 60 |
+| `RRF_SEMANTIC_WEIGHT` | Weight of the semantic ranked list in the fused score. Increase to let embeddings dominate. | 0.7 |
+| `RRF_KEYWORD_WEIGHT` | Weight of the keyword ranked list in the fused score. Increase for rare names/quotations/acronyms. | 0.3 |
 
 A `.env` file placed next to the server's cwd is auto-loaded. Values provided in the MCP client config always win.
 

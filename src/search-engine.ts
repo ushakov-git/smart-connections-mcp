@@ -38,17 +38,51 @@ export interface SearchOptions {
 
 const DEFAULT_EXCERPT_CHARS = 500;
 
+/**
+ * Tunable parameters of the hybrid Reciprocal Rank Fusion step.
+ *
+ * Note on semantics:
+ *   - `k` is a smoothing constant — it is applied identically to both
+ *     the semantic and the keyword ranked lists, so changing `k` alone
+ *     does NOT shift the balance between them. It just narrows the gap
+ *     between adjacent ranks (larger k → flatter score curve).
+ *   - `semantic_weight` / `keyword_weight` DO shift the balance. The
+ *     fused score is
+ *        score(id) = w_sem * Σ_semantic(1 / (k + rank + 1))
+ *                  + w_kw  * Σ_keyword (1 / (k + rank + 1))
+ *     Increase `semantic_weight` (e.g. 0.8 vs keyword 0.2) when you
+ *     want embeddings to dominate; increase `keyword_weight` when you
+ *     search mostly for rare names, quotations or acronyms that a
+ *     general-purpose embedder may miss.
+ */
+export interface FusionOptions {
+  k?: number;
+  semantic_weight?: number;
+  keyword_weight?: number;
+}
+
 export class SearchEngine {
   private loader: SmartConnectionsLoader;
   private active: ActiveModel;
   private vaultName?: string;
   private ollama: OllamaClient | null;
+  private fusion: Required<FusionOptions>;
 
-  constructor(loader: SmartConnectionsLoader, vaultName?: string, ollama: OllamaClient | null = null) {
+  constructor(
+    loader: SmartConnectionsLoader,
+    vaultName?: string,
+    ollama: OllamaClient | null = null,
+    fusion: FusionOptions = {},
+  ) {
     this.loader = loader;
     this.active = loader.getActiveModel();
     this.vaultName = vaultName;
     this.ollama = ollama;
+    this.fusion = {
+      k: fusion.k ?? 60,
+      semantic_weight: fusion.semantic_weight ?? 0.7,
+      keyword_weight: fusion.keyword_weight ?? 0.3,
+    };
   }
 
   setOllama(client: OllamaClient | null): void {
@@ -57,6 +91,10 @@ export class SearchEngine {
 
   hasSemantic(): boolean {
     return this.ollama !== null;
+  }
+
+  getFusionConfig(): Required<FusionOptions> {
+    return { ...this.fusion };
   }
 
   // -----------------------------------------------------------------
@@ -205,14 +243,15 @@ export class SearchEngine {
       };
     }
 
-    // hybrid: RRF over semantic + keyword
+    // hybrid: weighted RRF over semantic + keyword
     const keyword = this.searchKeyword(queryText, Math.max(limit * 3, 30), 0);
     const fused = rrfFuse(
       [
-        { list: semantic, idOf: (h) => resultRefId(h) },
-        { list: keyword, idOf: (h) => resultRefId(h) },
+        { list: semantic, idOf: (h) => resultRefId(h), weight: this.fusion.semantic_weight },
+        { list: keyword, idOf: (h) => resultRefId(h), weight: this.fusion.keyword_weight },
       ],
       limit,
+      this.fusion.k,
     );
     // Re-use the excerpt-enriched version from the semantic side when available,
     // otherwise fall back to the keyword entry.
@@ -501,21 +540,24 @@ function resultRefId(hit: SimilarNote): string {
 }
 
 /**
- * Reciprocal Rank Fusion with k=60 (standard choice). Lists are already
- * sorted by their own relevance. We return the top-N ids with their RRF
- * scores in [0..~0.033]; callers typically replace similarity with this
- * score for display.
+ * Weighted Reciprocal Rank Fusion. Each ranked list contributes
+ *   weight * 1 / (k + rank + 1)
+ * to every item it contains, and items' contributions sum across lists.
+ *
+ * `k` is a smoothing constant shared by all lists — it does not shift
+ * the balance between them. To tilt the fusion toward one list, change
+ * its `weight` (see FusionOptions in the SearchEngine for details).
  */
 function rrfFuse(
-  lists: Array<{ list: SimilarNote[]; idOf: (h: SimilarNote) => string }>,
+  lists: Array<{ list: SimilarNote[]; idOf: (h: SimilarNote) => string; weight?: number }>,
   limit: number,
   k = 60,
 ): Array<{ id: string; score: number }> {
   const scores = new Map<string, number>();
-  for (const { list, idOf } of lists) {
+  for (const { list, idOf, weight = 1 } of lists) {
     list.forEach((hit, rank) => {
       const id = idOf(hit);
-      scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1));
+      scores.set(id, (scores.get(id) ?? 0) + weight * (1 / (k + rank + 1)));
     });
   }
   return Array.from(scores.entries())

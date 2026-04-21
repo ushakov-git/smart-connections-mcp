@@ -84,8 +84,35 @@ if (semanticDisabled) {
   }
 }
 
-const searchEngine = new SearchEngine(loader, VAULT_NAME, ollamaClient);
+// -- Hybrid Reciprocal Rank Fusion tuning ----------------------------------
+// `k` is a smoothing constant; same value applied to both lists, so it does
+// not shift the semantic↔keyword balance — it only flattens the score curve.
+// The real lever for balance is the pair of weights: bump semantic_weight
+// (e.g. 0.8) when you want embeddings to dominate, or keyword_weight when
+// you search mostly for rare names/quotations.
+const fusion = {
+  k: parseNum(process.env.RRF_K, 60, 1, 1000),
+  semantic_weight: parseNum(process.env.RRF_SEMANTIC_WEIGHT, 0.7, 0, 10),
+  keyword_weight: parseNum(process.env.RRF_KEYWORD_WEIGHT, 0.3, 0, 10),
+};
+const searchEngine = new SearchEngine(loader, VAULT_NAME, ollamaClient, fusion);
 const linkResolver = new LinkResolver(loader, VAULT_NAME);
+
+console.error(
+  `[smart-connections-mcp] fusion: k=${fusion.k} semantic_weight=${fusion.semantic_weight} keyword_weight=${fusion.keyword_weight}`,
+);
+
+function parseNum(raw: string | undefined, dflt: number, min: number, max: number): number {
+  if (raw === undefined || raw.trim() === '') return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.error(
+      `[smart-connections-mcp] ignoring invalid env value "${raw}" (expected ${min}..${max}); using default ${dflt}`,
+    );
+    return dflt;
+  }
+  return n;
+}
 
 console.error(
   `[smart-connections-mcp] ready — vault="${VAULT_NAME}" path="${VAULT_PATH}" ` +
@@ -448,6 +475,7 @@ function baseMeta() {
     semantic_available: searchEngine.hasSemantic(),
     total_notes: loader.getSources().size,
     total_blocks: loader.getBlocks().size,
+    fusion: searchEngine.getFusionConfig(),
   };
 }
 
