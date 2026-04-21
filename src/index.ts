@@ -22,6 +22,7 @@ import { SmartConnectionsLoader } from './smart-connections-loader.js';
 import { SearchEngine } from './search-engine.js';
 import { OllamaClient } from './ollama-client.js';
 import { VaultWatcher } from './vault-watcher.js';
+import { LinkResolver } from './link-resolver.js';
 
 // --------------------------------------------------------------- bootstrap
 
@@ -84,6 +85,7 @@ if (semanticDisabled) {
 }
 
 const searchEngine = new SearchEngine(loader, VAULT_NAME, ollamaClient);
+const linkResolver = new LinkResolver(loader, VAULT_NAME);
 
 console.error(
   `[smart-connections-mcp] ready — vault="${VAULT_NAME}" path="${VAULT_PATH}" ` +
@@ -162,6 +164,10 @@ const GetBlockContentSchema = z
   .refine((v) => !!v.block_key || (!!v.path && !!v.heading), {
     message: 'Provide either block_key or both (path, heading).',
   });
+
+const ResolveLinkSchema = z.object({
+  link: z.string().min(1).max(2048),
+});
 
 const GetStatsSchema = z.object({});
 
@@ -291,9 +297,21 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'resolve_link',
+    description:
+      'Parse an Obsidian-style link and return the vault-relative `path` plus optional `heading`. Accepts wikilinks like "[[Folder/Note#Section]]" / "[[Note|Alias]]" and obsidian:// URIs (`open?vault=...&file=...`, or advanced-uri `filepath`/`heading`/`block`). Does not read the file — pair with `get_note_content` or `get_block_content` to fetch contents.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        link: { type: 'string', description: 'Wikilink or obsidian:// URI.' },
+      },
+      required: ['link'],
+    },
+  },
+  {
     name: 'get_stats',
     description:
-      'Diagnostics: active model, runtime-detected dims, totals (notes, blocks), vault name, vault path.',
+      'Diagnostics: active model, runtime-detected dims, totals (notes, blocks), vault name, vault path, Ollama availability.',
     inputSchema: { type: 'object', properties: {} },
   },
 ];
@@ -309,8 +327,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const startedAt = Date.now();
 
-  const ok = (data: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] });
+  const ok = (data: unknown) => {
+    const execution_ms = Date.now() - startedAt;
+    // Merge execution_ms into meta if the payload uses the {meta, ...} shape.
+    if (data && typeof data === 'object' && 'meta' in (data as Record<string, unknown>)) {
+      const d = data as { meta?: Record<string, unknown>; [k: string]: unknown };
+      d.meta = { ...(d.meta ?? {}), execution_ms };
+    }
+    return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  };
 
   try {
     switch (name) {
@@ -389,6 +416,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return ok({ meta: baseMeta(), ...result });
       }
 
+      case 'resolve_link': {
+        const p = ResolveLinkSchema.parse(args);
+        const resolved = linkResolver.resolve(p.link);
+        return ok({ meta: { ...baseMeta(), warnings: resolved.warnings }, ...resolved });
+      }
+
       case 'get_stats': {
         GetStatsSchema.parse(args);
         const loadStats = loader.getLoadStats();
@@ -413,6 +446,8 @@ function baseMeta() {
     model_key: activeModel.model_key,
     dims: activeModel.dims,
     semantic_available: searchEngine.hasSemantic(),
+    total_notes: loader.getSources().size,
+    total_blocks: loader.getBlocks().size,
   };
 }
 

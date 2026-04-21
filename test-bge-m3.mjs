@@ -10,6 +10,7 @@ import { SmartConnectionsLoader } from './dist/smart-connections-loader.js';
 import { SearchEngine } from './dist/search-engine.js';
 import { OllamaClient } from './dist/ollama-client.js';
 import { VaultWatcher } from './dist/vault-watcher.js';
+import { LinkResolver } from './dist/link-resolver.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -233,5 +234,51 @@ const beforeFull = { sources: loader.getSources().size, blocks: loader.getBlocks
 loader.fullReload();
 ok('fullReload recovers source count', loader.getSources().size === beforeFull.sources, `before=${beforeFull.sources} after=${loader.getSources().size}`);
 ok('fullReload recovers block count', loader.getBlocks().size === beforeFull.blocks, `before=${beforeFull.blocks} after=${loader.getBlocks().size}`);
+
+// -------- Phase 6: link resolver --------
+const resolver = new LinkResolver(loader, VAULT_NAME);
+
+// Full-path wikilink with heading.
+if (samplePath) {
+  const bare = samplePath.replace(/\.md$/, '');
+  const r = resolver.resolve(`[[${bare}#Section]]`);
+  ok('resolves full-path wikilink', r.path === samplePath, `path=${r.path}`);
+  ok('preserves heading', r.heading === '#Section');
+  ok('form=wikilink', r.form === 'wikilink');
+}
+
+// Bare note name (basename lookup).
+if (samplePath) {
+  const basename = (samplePath.split('/').pop() ?? '').replace(/\.md$/, '');
+  const r = resolver.resolve(`[[${basename}]]`);
+  ok('resolves bare wikilink via basename index', typeof r.path === 'string' && r.path.length > 0, `path=${r.path}`);
+}
+
+// obsidian:// open?vault=...&file=...
+if (samplePath) {
+  const file = samplePath.replace(/\.md$/, '');
+  const r = resolver.resolve(`obsidian://open?vault=${encodeURIComponent(VAULT_NAME)}&file=${encodeURIComponent(file)}`);
+  ok('resolves obsidian://open URI', r.path === samplePath);
+  ok('URI form reported', r.form === 'obsidian-uri');
+  ok('no vault_mismatch for matching vault', !r.vault_mismatch);
+}
+
+// obsidian:// with a mismatching vault name.
+if (samplePath) {
+  const file = samplePath.replace(/\.md$/, '');
+  const r = resolver.resolve(`obsidian://open?vault=OtherVault&file=${encodeURIComponent(file)}`);
+  ok('mismatching vault produces warning + vault_mismatch', r.vault_mismatch === true && r.warnings.length > 0);
+}
+
+// Alias handling: [[Note|Alias]].
+if (samplePath) {
+  const basename = (samplePath.split('/').pop() ?? '').replace(/\.md$/, '');
+  const r = resolver.resolve(`[[${basename}|alias-text]]`);
+  ok('wikilink alias is stripped', typeof r.path === 'string' && !/alias/i.test(r.path));
+}
+
+// Unknown note: no throw, warning set.
+const unknown = resolver.resolve('[[This Note Does Not Exist 9999]]');
+ok('unknown note returns path + warning', typeof unknown.path === 'string' && unknown.warnings.length > 0);
 
 console.log(`\n=== ${results.filter(r => r.cond).length}/${results.length} passed ===`);
