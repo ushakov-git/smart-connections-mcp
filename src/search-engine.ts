@@ -1,269 +1,399 @@
 /**
- * Semantic search engine for Smart Connections
+ * Semantic search engine for Smart Connections MCP.
+ *
+ * The engine operates over two parallel indexes:
+ *   - Notes  (SmartSource, one embedding per note)
+ *   - Blocks (SmartBlock, one embedding per heading-scoped section)
+ *
+ * Every returned hit is enriched with a `ResultRef`:
+ *     { path, heading?, lines?, vault_name? }
+ * plus `excerpt`/`excerpt_truncated` when `include_excerpt` is set. This
+ * lets the calling agent either use the embedding match directly or
+ * follow the reference to read the underlying markdown via
+ * `get_note_content` / `get_block_content`.
  */
 
-import type { SmartSource, SimilarNote, ConnectionNode, ConnectionGraph, NoteContent } from './types.js';
+import type {
+  SmartSource,
+  SmartBlock,
+  SimilarNote,
+  ConnectionGraph,
+  NoteContent,
+  ActiveModel,
+} from './types.js';
 import { cosineSimilarity, findNearestNeighbors } from './embedding-utils.js';
 import type { SmartConnectionsLoader } from './smart-connections-loader.js';
 
+export type Granularity = 'note' | 'block';
+
+export interface SearchOptions {
+  threshold?: number;
+  limit?: number;
+  granularity?: Granularity;
+  include_excerpt?: boolean;
+  excerpt_chars?: number;
+}
+
+const DEFAULT_EXCERPT_CHARS = 500;
+
 export class SearchEngine {
   private loader: SmartConnectionsLoader;
-  private embeddingModelKey: string;
+  private active: ActiveModel;
+  private vaultName?: string;
 
-  constructor(loader: SmartConnectionsLoader) {
+  constructor(loader: SmartConnectionsLoader, vaultName?: string) {
     this.loader = loader;
-    this.embeddingModelKey = loader.getEmbeddingModelKey();
+    this.active = loader.getActiveModel();
+    this.vaultName = vaultName;
   }
 
+  // -----------------------------------------------------------------
+  // Similar (by existing note or block)
+  // -----------------------------------------------------------------
+
   /**
-   * Find similar notes to a given note path
+   * Find items similar to the embedding of an existing note. Granularity
+   * selects what populates the result set — blocks give heading-scoped
+   * precision, notes give document-level overview.
    */
   getSimilarNotes(
     notePath: string,
-    threshold: number = 0.5,
-    limit: number = 10
+    threshold = 0.5,
+    limit = 10,
+    opts: Omit<SearchOptions, 'threshold' | 'limit'> = {},
   ): SimilarNote[] {
     const source = this.loader.getSource(notePath);
-
-    if (!source) {
-      throw new Error(`Note not found: ${notePath}`);
+    if (!source) throw new Error(`Note not found: ${notePath}`);
+    const queryVec = source.embeddings[this.active.model_key]?.vec;
+    if (!queryVec || queryVec.length === 0) {
+      throw new Error(`No embedding for note under active model "${this.active.model_key}": ${notePath}`);
     }
-
-    const embeddings = source.embeddings[this.embeddingModelKey];
-
-    if (!embeddings || !embeddings.vec) {
-      throw new Error(`No embeddings found for note: ${notePath}`);
-    }
-
-    // Build vector dataset from all sources
-    const vectors = Array.from(this.loader.getSources().entries())
-      .filter(([path]) => path !== notePath) // Exclude the query note itself
-      .map(([path, src]) => {
-        const emb = src.embeddings[this.embeddingModelKey];
-        return {
-          id: path,
-          vec: emb?.vec || [],
-          metadata: {
-            blocks: Object.keys(src.blocks || {}),
-            lastModified: src.last_import?.mtime || 0
-          }
-        };
-      })
-      .filter(item => item.vec.length > 0);
-
-    // Find nearest neighbors
-    const neighbors = findNearestNeighbors(
-      embeddings.vec,
-      vectors,
+    return this.rankByVector(queryVec, {
+      threshold,
       limit,
-      threshold
-    );
-
-    // Convert to SimilarNote format
-    return neighbors.map(neighbor => ({
-      path: neighbor.id,
-      similarity: neighbor.similarity,
-      blocks: neighbor.metadata.blocks
-    }));
+      granularity: opts.granularity ?? 'block',
+      include_excerpt: opts.include_excerpt ?? true,
+      excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
+      excludePath: notePath,
+    });
   }
 
-  /**
-   * Get embedding neighbors for a given embedding vector
-   */
+  /** Find blocks similar to an existing block identified by `path#heading-chain`. */
+  getSimilarBlocks(
+    blockKey: string,
+    threshold = 0.5,
+    limit = 10,
+    opts: Omit<SearchOptions, 'threshold' | 'limit' | 'granularity'> = {},
+  ): SimilarNote[] {
+    const block = this.loader.getBlock(blockKey);
+    if (!block) throw new Error(`Block not found: ${blockKey}`);
+    const queryVec = block.embeddings[this.active.model_key]?.vec;
+    if (!queryVec) throw new Error(`No embedding for block under active model: ${blockKey}`);
+    return this.rankByVector(queryVec, {
+      threshold,
+      limit,
+      granularity: 'block',
+      include_excerpt: opts.include_excerpt ?? true,
+      excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
+      excludeBlockKey: blockKey,
+    });
+  }
+
+  // -----------------------------------------------------------------
+  // Raw-vector search (for clients that have their own embedding)
+  // -----------------------------------------------------------------
+
   getEmbeddingNeighbors(
     embeddingVector: number[],
-    k: number = 10,
-    threshold: number = 0.5
+    k = 10,
+    threshold = 0.5,
+    opts: Omit<SearchOptions, 'threshold' | 'limit'> = {},
   ): SimilarNote[] {
-    // Build vector dataset from all sources
-    const vectors = Array.from(this.loader.getSources().entries())
-      .map(([path, src]) => {
-        const emb = src.embeddings[this.embeddingModelKey];
-        return {
-          id: path,
-          vec: emb?.vec || [],
-          metadata: {
-            blocks: Object.keys(src.blocks || {}),
-            lastModified: src.last_import?.mtime || 0
-          }
-        };
-      })
-      .filter(item => item.vec.length > 0);
-
-    // Find nearest neighbors
-    const neighbors = findNearestNeighbors(
-      embeddingVector,
-      vectors,
-      k,
-      threshold
-    );
-
-    // Convert to SimilarNote format
-    return neighbors.map(neighbor => ({
-      path: neighbor.id,
-      similarity: neighbor.similarity,
-      blocks: neighbor.metadata.blocks
-    }));
+    if (embeddingVector.length !== this.active.dims) {
+      throw new Error(
+        `embedding_vector has ${embeddingVector.length} dims, expected ${this.active.dims} (model: ${this.active.model_key})`,
+      );
+    }
+    return this.rankByVector(embeddingVector, {
+      threshold,
+      limit: k,
+      granularity: opts.granularity ?? 'block',
+      include_excerpt: opts.include_excerpt ?? true,
+      excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
+    });
   }
 
-  /**
-   * Build a connection graph starting from a note
-   */
-  getConnectionGraph(
-    notePath: string,
-    depth: number = 2,
-    threshold: number = 0.6,
-    maxPerLevel: number = 5
-  ): ConnectionGraph {
-    const visited = new Set<string>();
-    const flatConnections: Array<{ path: string; depth: number; similarity: number }> = [];
+  // -----------------------------------------------------------------
+  // Keyword fallback for search_notes (phase 4 replaces with embed+cosine)
+  // -----------------------------------------------------------------
 
-    const buildGraph = (
-      currentPath: string,
-      currentDepth: number,
-      parentSimilarity: number = 1.0
-    ): void => {
-      visited.add(currentPath);
-
-      // Add to flat list (skip root at depth 0)
-      if (currentDepth > 0) {
-        flatConnections.push({
-          path: currentPath,
-          depth: currentDepth,
-          similarity: parentSimilarity
-        });
-      }
-
-      // Stop if we've reached max depth
-      if (currentDepth >= depth) {
-        return;
-      }
-
-      // Find similar notes
-      try {
-        const similar = this.getSimilarNotes(
-          currentPath,
-          threshold,
-          maxPerLevel
-        );
-
-        // Recursively build connections
-        for (const sim of similar) {
-          // Skip already visited nodes to prevent cycles
-          if (!visited.has(sim.path)) {
-            buildGraph(
-              sim.path,
-              currentDepth + 1,
-              sim.similarity
-            );
-          }
-        }
-      } catch (error) {
-        console.error(`Error building graph for ${currentPath}:`, error);
-      }
-    };
-
-    buildGraph(notePath, 0);
-
-    return {
-      root: notePath,
-      connections: flatConnections
-    };
-  }
-
-  /**
-   * Search notes by content similarity
-   */
-  searchByQuery(
-    queryText: string,
-    limit: number = 10,
-    threshold: number = 0.5
-  ): SimilarNote[] {
-    // For now, we'll do a simple keyword match since we don't have
-    // a way to generate embeddings for arbitrary text without the model.
-    // In a full implementation, you'd call the embedding model here.
-
+  searchByQuery(queryText: string, limit = 10, threshold = 0.5): SimilarNote[] {
     const results: SimilarNote[] = [];
     const queryLower = queryText.toLowerCase();
 
-    for (const [path, source] of this.loader.getSources()) {
+    for (const [p, source] of this.loader.getSources()) {
       try {
-        const content = this.loader.readNoteContent(path).toLowerCase();
-
-        // Simple relevance scoring based on keyword matches
-        const matches = (content.match(new RegExp(queryLower, 'gi')) || []).length;
-
+        const content = this.loader.readNoteContent(p).toLowerCase();
+        const matches = (content.match(new RegExp(escapeRegex(queryLower), 'gi')) || []).length;
         if (matches > 0) {
-          // Normalize score (this is a crude approximation)
           const score = Math.min(matches / 10, 1.0);
-
           if (score >= threshold) {
             results.push({
-              path,
+              path: p,
               similarity: score,
-              blocks: Object.keys(source.blocks || {})
+              blocks: Object.keys(source.blocks || {}),
+              vault_name: this.vaultName,
             });
           }
         }
-      } catch (error) {
-        // Skip notes that can't be read
-        continue;
+      } catch {
+        // unreadable — ignore silently
       }
     }
 
-    // Sort by similarity and limit
-    return results
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, limit);
+    return results.sort((a, b) => b.similarity - a.similarity).slice(0, limit);
   }
 
-  /**
-   * Get note content with matched blocks highlighted
-   */
-  getNoteWithContext(
-    notePath: string,
-    includeBlocks: string[] = []
-  ): NoteContent {
+  // -----------------------------------------------------------------
+  // Content access
+  // -----------------------------------------------------------------
+
+  getNoteWithContext(notePath: string, _includeBlocks: string[] = []): NoteContent {
     const content = this.loader.readNoteContent(notePath);
     const source = this.loader.getSource(notePath);
     const availableBlocks = source ? Object.keys(source.blocks || {}) : [];
-
-    return {
-      path: notePath,
-      content,
-      blocks: availableBlocks
-    };
+    return { path: notePath, content, blocks: availableBlocks };
   }
 
   /**
-   * Get statistics about the knowledge base
+   * Extract a single block's markdown content. Accepts either the
+   * compound block key (`path#heading`) or a split `{path, heading}`.
+   * Throws if the block's line range is unknown.
    */
-  getStats(): {
-    totalNotes: number;
-    totalBlocks: number;
-    embeddingDimension: number;
-    modelKey: string;
+  getBlockContent(args: { block_key?: string; path?: string; heading?: string }): {
+    path: string;
+    heading: string;
+    lines: [number, number];
+    content: string;
+    vault_name?: string;
   } {
+    let path: string;
+    let heading: string;
+    if (args.block_key) {
+      const i = args.block_key.indexOf('#');
+      if (i <= 0) throw new Error('Malformed block_key — expected "<path>#<heading>"');
+      path = args.block_key.slice(0, i);
+      heading = args.block_key.slice(i);
+    } else if (args.path && args.heading) {
+      path = args.path;
+      heading = args.heading.startsWith('#') ? args.heading : `#${args.heading}`;
+    } else {
+      throw new Error('Supply either block_key or both (path, heading)');
+    }
+
+    const range = this.loader.resolveBlockRange(path, heading);
+    if (!range || range[0] <= 0) {
+      throw new Error(`Block line range unknown for ${path}${heading}`);
+    }
+    const full = this.loader.readNoteContent(path);
+    const content = full.split('\n').slice(range[0] - 1, range[1]).join('\n');
+    return { path, heading, lines: range, content, vault_name: this.vaultName };
+  }
+
+  // -----------------------------------------------------------------
+  // Stats
+  // -----------------------------------------------------------------
+
+  getStats() {
     const sources = this.loader.getSources();
-    let totalBlocks = 0;
-    let embeddingDim = 0;
+    const blocks = this.loader.getBlocks();
+    let totalSourceBlocks = 0;
+    for (const src of sources.values()) {
+      totalSourceBlocks += Object.keys(src.blocks || {}).length;
+    }
+    return {
+      totalNotes: sources.size,
+      totalBlocks: blocks.size,
+      totalSourceBlockHeadings: totalSourceBlocks,
+      embeddingDimension: this.active.dims,
+      modelKey: this.active.model_key,
+      providerKey: this.active.provider_key || undefined,
+      modelFullKey: this.active.full_key || undefined,
+      modelResolution: this.active.resolution,
+      vaultName: this.vaultName,
+      vaultPath: this.loader.getVaultPath(),
+    };
+  }
 
-    for (const source of sources.values()) {
-      totalBlocks += Object.keys(source.blocks || {}).length;
+  // -----------------------------------------------------------------
+  // Connection graph — nested tree (no more flat list)
+  // -----------------------------------------------------------------
 
-      if (embeddingDim === 0) {
-        const emb = source.embeddings[this.embeddingModelKey];
-        if (emb?.vec) {
-          embeddingDim = emb.vec.length;
+  getConnectionGraph(
+    notePath: string,
+    depth = 2,
+    threshold = 0.6,
+    maxPerLevel = 5,
+  ): ConnectionGraph {
+    const visited = new Set<string>();
+
+    type Node = {
+      path: string;
+      depth: number;
+      similarity: number;
+      children: Node[];
+    };
+
+    const build = (currentPath: string, currentDepth: number, similarity: number): Node => {
+      visited.add(currentPath);
+      const node: Node = { path: currentPath, depth: currentDepth, similarity, children: [] };
+      if (currentDepth >= depth) return node;
+      try {
+        const similar = this.getSimilarNotes(currentPath, threshold, maxPerLevel, {
+          granularity: 'note',
+          include_excerpt: false,
+        });
+        for (const hit of similar) {
+          if (visited.has(hit.path)) continue;
+          node.children.push(build(hit.path, currentDepth + 1, hit.similarity));
         }
+      } catch {
+        // note without embedding — leaf
+      }
+      return node;
+    };
+
+    const root = build(notePath, 0, 1.0);
+
+    // Flatten for back-compat with the ConnectionGraph type, but also expose
+    // the nested tree under `tree` so new clients can use it directly.
+    const flat: ConnectionGraph['connections'] = [];
+    const walk = (n: Node) => {
+      if (n.depth > 0) flat.push({ path: n.path, depth: n.depth, similarity: n.similarity });
+      for (const c of n.children) walk(c);
+    };
+    walk(root);
+
+    return {
+      root: notePath,
+      connections: flat,
+      // `tree` is an extension that existing ConnectionGraph consumers ignore.
+      ...({ tree: root } as object),
+    } as ConnectionGraph;
+  }
+
+  // -----------------------------------------------------------------
+  // Internals
+  // -----------------------------------------------------------------
+
+  private rankByVector(
+    queryVec: number[],
+    opts: {
+      threshold: number;
+      limit: number;
+      granularity: Granularity;
+      include_excerpt: boolean;
+      excerpt_chars: number;
+      excludePath?: string;
+      excludeBlockKey?: string;
+    },
+  ): SimilarNote[] {
+    const { granularity, threshold, limit, include_excerpt, excerpt_chars, excludePath, excludeBlockKey } = opts;
+
+    const items: Array<{ id: string; vec: number[]; meta: { type: 'note' | 'block'; source?: SmartSource; block?: SmartBlock } }> = [];
+
+    if (granularity === 'note') {
+      for (const [p, src] of this.loader.getSources()) {
+        if (excludePath && p === excludePath) continue;
+        const v = src.embeddings[this.active.model_key]?.vec;
+        if (!v || v.length === 0) continue;
+        items.push({ id: p, vec: v, meta: { type: 'note', source: src } });
+      }
+    } else {
+      for (const [k, block] of this.loader.getBlocks()) {
+        if (excludeBlockKey && k === excludeBlockKey) continue;
+        if (excludePath && block.source_path === excludePath) continue;
+        const v = block.embeddings[this.active.model_key]?.vec;
+        if (!v || v.length === 0) continue;
+        items.push({ id: k, vec: v, meta: { type: 'block', block } });
       }
     }
 
-    return {
-      totalNotes: sources.size,
-      totalBlocks,
-      embeddingDimension: embeddingDim,
-      modelKey: this.embeddingModelKey
-    };
+    const neighbors = findNearestNeighbors(queryVec, items, limit, threshold);
+    return neighbors.map((n) => {
+      const meta = (items.find((it) => it.id === n.id)?.meta) as {
+        type: 'note' | 'block';
+        source?: SmartSource;
+        block?: SmartBlock;
+      };
+      if (meta.type === 'note') {
+        const src = meta.source!;
+        const hit: SimilarNote = {
+          path: src.path,
+          similarity: n.similarity,
+          blocks: Object.keys(src.blocks || {}),
+          vault_name: this.vaultName,
+        };
+        if (include_excerpt) {
+          const ex = this.noteExcerpt(src.path, excerpt_chars);
+          if (ex) {
+            hit.excerpt = ex.text;
+            hit.excerpt_truncated = ex.truncated;
+          }
+        }
+        return hit;
+      } else {
+        const b = meta.block!;
+        const hit: SimilarNote = {
+          path: b.source_path,
+          heading: b.heading,
+          lines: b.lines[0] > 0 ? b.lines : undefined,
+          similarity: n.similarity,
+          vault_name: this.vaultName,
+        };
+        if (include_excerpt) {
+          const ex = this.blockExcerpt(b, excerpt_chars);
+          if (ex) {
+            hit.excerpt = ex.text;
+            hit.excerpt_truncated = ex.truncated;
+          }
+        }
+        return hit;
+      }
+    });
+  }
+
+  private noteExcerpt(notePath: string, maxChars: number): { text: string; truncated: boolean } | null {
+    try {
+      const full = this.loader.readNoteContent(notePath);
+      return truncate(full, maxChars);
+    } catch {
+      return null;
+    }
+  }
+
+  private blockExcerpt(block: SmartBlock, maxChars: number): { text: string; truncated: boolean } | null {
+    if (block.lines[0] <= 0) return this.noteExcerpt(block.source_path, maxChars);
+    try {
+      const content = this.loader.readNoteContent(block.source_path);
+      const sliced = content.split('\n').slice(block.lines[0] - 1, block.lines[1]).join('\n');
+      return truncate(sliced, maxChars);
+    } catch {
+      return null;
+    }
   }
 }
+
+function truncate(text: string, maxChars: number): { text: string; truncated: boolean } {
+  if (text.length <= maxChars) return { text, truncated: false };
+  return { text: text.slice(0, maxChars), truncated: true };
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Unused imports kept-away from eslint-nopunctuation by referencing types.
+export type { ConnectionGraph };
+// cosineSimilarity is re-exported because older callers imported it from here.
+export { cosineSimilarity };

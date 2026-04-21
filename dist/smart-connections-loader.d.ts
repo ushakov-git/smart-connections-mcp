@@ -14,13 +14,17 @@
  *      metadata `dims` in the plugin is known to lie (e.g. bge-m3 is 1024
  *      but the plugin records 384).
  */
-import type { SmartSource, SmartEnvConfig, ActiveModel } from './types.js';
+import type { SmartSource, SmartBlock, SmartEnvConfig, ActiveModel } from './types.js';
 export interface LoadStats {
     sourceFilesScanned: number;
     sourcesKept: number;
     sourcesReplaced: number;
     sourcesSkippedNoEmbedding: number;
     sourcesSkippedNullPath: number;
+    blocksKept: number;
+    blocksReplaced: number;
+    blocksSkippedNoEmbedding: number;
+    blocksSkippedBadKey: number;
     parseErrors: number;
 }
 export declare class SmartConnectionsLoader {
@@ -28,6 +32,9 @@ export declare class SmartConnectionsLoader {
     private smartEnvPath;
     private config;
     private sources;
+    private blocks;
+    /** Secondary index: source path → list of block keys it contains. */
+    private blocksBySource;
     private embeddingModels;
     private active;
     private stats;
@@ -52,10 +59,25 @@ export declare class SmartConnectionsLoader {
      */
     private autodetectActiveModel;
     private loadSources;
+    private ingestSource;
+    /**
+     * `compoundKey` is the ajson key minus the `smart_blocks:` prefix,
+     * e.g. `"01 MASTRA/Foo.md#---frontmatter---"` or `"Note.md#Section#Subsection"`.
+     *
+     * Parsing: Obsidian forbids `#` in file names, so the first `#` always
+     * marks the boundary between source path and heading chain. The heading
+     * chain is kept verbatim — including the leading `#` — to match the
+     * format used inside `SmartSource.blocks`.
+     */
+    private ingestBlock;
     private finalizeDims;
     private logStartupDiagnostics;
     getSources(): Map<string, SmartSource>;
     getSource(notePath: string): SmartSource | undefined;
+    getBlocks(): Map<string, SmartBlock>;
+    getBlock(blockKey: string): SmartBlock | undefined;
+    /** List block keys contained in a given note. Empty array if none indexed. */
+    getBlockKeysForSource(notePath: string): string[];
     getConfig(): SmartEnvConfig | null;
     getActiveModel(): ActiveModel;
     /** @deprecated Kept for compatibility during migration; prefer getActiveModel().model_key. */
@@ -69,6 +91,12 @@ export declare class SmartConnectionsLoader {
      */
     readNoteContent(notePath: string): string;
     extractBlockContent(notePath: string, blockHeading: string): string;
+    /**
+     * Resolve a block's line range, preferring the block index (indexed by
+     * compound key `path#heading`) and falling back to the parent source's
+     * `blocks` map. Returns `undefined` if unknown.
+     */
+    resolveBlockRange(notePath: string, blockHeading: string): [number, number] | undefined;
     /**
      * Join `notePath` onto the vault root and assert containment. Rejects
      * absolute paths, `..` escapes, and symlinks that point outside.

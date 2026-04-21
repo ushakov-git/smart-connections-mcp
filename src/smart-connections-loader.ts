@@ -17,7 +17,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { SmartSource, SmartEnvConfig, ActiveModel } from './types.js';
+import type { SmartSource, SmartBlock, SmartEnvConfig, ActiveModel } from './types.js';
 import { parseAjsonLines } from './ajson-parser.js';
 import { EmbeddingModelsLoader } from './embedding-models-loader.js';
 
@@ -27,6 +27,10 @@ export interface LoadStats {
   sourcesReplaced: number;
   sourcesSkippedNoEmbedding: number;
   sourcesSkippedNullPath: number;
+  blocksKept: number;
+  blocksReplaced: number;
+  blocksSkippedNoEmbedding: number;
+  blocksSkippedBadKey: number;
   parseErrors: number;
 }
 
@@ -35,6 +39,9 @@ export class SmartConnectionsLoader {
   private smartEnvPath: string;
   private config: SmartEnvConfig | null = null;
   private sources: Map<string, SmartSource> = new Map();
+  private blocks: Map<string, SmartBlock> = new Map();
+  /** Secondary index: source path → list of block keys it contains. */
+  private blocksBySource: Map<string, string[]> = new Map();
   private embeddingModels: EmbeddingModelsLoader;
   private active: ActiveModel | null = null;
   private stats: LoadStats = {
@@ -43,6 +50,10 @@ export class SmartConnectionsLoader {
     sourcesReplaced: 0,
     sourcesSkippedNoEmbedding: 0,
     sourcesSkippedNullPath: 0,
+    blocksKept: 0,
+    blocksReplaced: 0,
+    blocksSkippedNoEmbedding: 0,
+    blocksSkippedBadKey: 0,
     parseErrors: 0,
   };
 
@@ -201,24 +212,11 @@ export class SmartConnectionsLoader {
       parseAjsonLines(
         content,
         (key, value) => {
-          if (!key.startsWith('smart_sources:')) return;
-          const src = value as SmartSource | null;
-          if (!src) return;
-          if (!src.path) {
-            this.stats.sourcesSkippedNullPath += 1;
-            return;
+          if (key.startsWith('smart_sources:')) {
+            this.ingestSource(value);
+          } else if (key.startsWith('smart_blocks:')) {
+            this.ingestBlock(key.slice('smart_blocks:'.length), value);
           }
-          const vec = src.embeddings?.[this.active!.model_key]?.vec;
-          if (!Array.isArray(vec) || vec.length === 0) {
-            this.stats.sourcesSkippedNoEmbedding += 1;
-            return;
-          }
-          if (this.sources.has(src.path)) {
-            this.stats.sourcesReplaced += 1;
-          } else {
-            this.stats.sourcesKept += 1;
-          }
-          this.sources.set(src.path, src);
         },
         {
           onError: () => {
@@ -229,10 +227,89 @@ export class SmartConnectionsLoader {
     }
   }
 
+  private ingestSource(value: unknown): void {
+    const src = value as SmartSource | null;
+    if (!src) return;
+    if (!src.path) {
+      this.stats.sourcesSkippedNullPath += 1;
+      return;
+    }
+    const vec = src.embeddings?.[this.active!.model_key]?.vec;
+    if (!Array.isArray(vec) || vec.length === 0) {
+      this.stats.sourcesSkippedNoEmbedding += 1;
+      return;
+    }
+    if (this.sources.has(src.path)) this.stats.sourcesReplaced += 1;
+    else this.stats.sourcesKept += 1;
+    this.sources.set(src.path, src);
+  }
+
+  /**
+   * `compoundKey` is the ajson key minus the `smart_blocks:` prefix,
+   * e.g. `"01 MASTRA/Foo.md#---frontmatter---"` or `"Note.md#Section#Subsection"`.
+   *
+   * Parsing: Obsidian forbids `#` in file names, so the first `#` always
+   * marks the boundary between source path and heading chain. The heading
+   * chain is kept verbatim — including the leading `#` — to match the
+   * format used inside `SmartSource.blocks`.
+   */
+  private ingestBlock(compoundKey: string, value: unknown): void {
+    const raw = value as Record<string, unknown> | null;
+    if (!raw) return;
+
+    const hashIdx = compoundKey.indexOf('#');
+    if (hashIdx <= 0) {
+      this.stats.blocksSkippedBadKey += 1;
+      return;
+    }
+    const sourcePath = compoundKey.slice(0, hashIdx);
+    const heading = compoundKey.slice(hashIdx);
+
+    const embeddings = raw.embeddings as SmartBlock['embeddings'] | undefined;
+    const vec = embeddings?.[this.active!.model_key]?.vec;
+    if (!Array.isArray(vec) || vec.length === 0) {
+      this.stats.blocksSkippedNoEmbedding += 1;
+      return;
+    }
+
+    const linesRaw = raw.lines;
+    const lines: [number, number] =
+      Array.isArray(linesRaw) && linesRaw.length === 2 && typeof linesRaw[0] === 'number' && typeof linesRaw[1] === 'number'
+        ? [linesRaw[0], linesRaw[1]]
+        : [0, 0];
+
+    const block: SmartBlock = {
+      key: compoundKey,
+      source_path: sourcePath,
+      heading,
+      lines,
+      size: typeof raw.size === 'number' ? raw.size : undefined,
+      embeddings: embeddings!, // guaranteed non-null: we bailed above if vec was missing
+    };
+
+    if (this.blocks.has(compoundKey)) this.stats.blocksReplaced += 1;
+    else this.stats.blocksKept += 1;
+    this.blocks.set(compoundKey, block);
+
+    const list = this.blocksBySource.get(sourcePath);
+    if (list) {
+      if (!list.includes(compoundKey)) list.push(compoundKey);
+    } else {
+      this.blocksBySource.set(sourcePath, [compoundKey]);
+    }
+  }
+
   private finalizeDims(): void {
     if (!this.active) return;
     for (const src of this.sources.values()) {
       const vec = src.embeddings?.[this.active.model_key]?.vec;
+      if (Array.isArray(vec) && vec.length > 0) {
+        this.active.dims = vec.length;
+        return;
+      }
+    }
+    for (const block of this.blocks.values()) {
+      const vec = block.embeddings?.[this.active.model_key]?.vec;
       if (Array.isArray(vec) && vec.length > 0) {
         this.active.dims = vec.length;
         return;
@@ -255,6 +332,10 @@ export class SmartConnectionsLoader {
         `${s.sourcesSkippedNoEmbedding} no-embedding / ${s.sourcesSkippedNullPath} null-path / ` +
         `${s.parseErrors} parse-errors (from ${s.sourceFilesScanned} .ajson files)`,
     );
+    console.error(
+      `[smart-connections-mcp] blocks:  ${s.blocksKept} kept / ${s.blocksReplaced} replaced / ` +
+        `${s.blocksSkippedNoEmbedding} no-embedding / ${s.blocksSkippedBadKey} bad-key`,
+    );
     if (s.sourcesKept === 0) {
       console.error(
         `[smart-connections-mcp] WARNING: 0 sources matched active model "${a.model_key}". ` +
@@ -272,6 +353,19 @@ export class SmartConnectionsLoader {
 
   getSource(notePath: string): SmartSource | undefined {
     return this.sources.get(notePath);
+  }
+
+  getBlocks(): Map<string, SmartBlock> {
+    return this.blocks;
+  }
+
+  getBlock(blockKey: string): SmartBlock | undefined {
+    return this.blocks.get(blockKey);
+  }
+
+  /** List block keys contained in a given note. Empty array if none indexed. */
+  getBlockKeysForSource(notePath: string): string[] {
+    return this.blocksBySource.get(notePath) ?? [];
   }
 
   getConfig(): SmartEnvConfig | null {
@@ -308,12 +402,23 @@ export class SmartConnectionsLoader {
 
   extractBlockContent(notePath: string, blockHeading: string): string {
     const content = this.readNoteContent(notePath);
-    const source = this.getSource(notePath);
-    const range = source?.blocks?.[blockHeading];
+    const range = this.resolveBlockRange(notePath, blockHeading);
     if (!range) return '';
     const [startLine, endLine] = range;
     const lines = content.split('\n');
     return lines.slice(startLine - 1, endLine).join('\n');
+  }
+
+  /**
+   * Resolve a block's line range, preferring the block index (indexed by
+   * compound key `path#heading`) and falling back to the parent source's
+   * `blocks` map. Returns `undefined` if unknown.
+   */
+  resolveBlockRange(notePath: string, blockHeading: string): [number, number] | undefined {
+    const block = this.blocks.get(`${notePath}${blockHeading}`);
+    if (block && block.lines[0] > 0) return block.lines;
+    const range = this.getSource(notePath)?.blocks?.[blockHeading];
+    return range ? [range[0], range[1]] : undefined;
   }
 
   /**
