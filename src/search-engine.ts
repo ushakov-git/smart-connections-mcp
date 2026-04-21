@@ -23,8 +23,10 @@ import type {
 } from './types.js';
 import { cosineSimilarity, findNearestNeighbors } from './embedding-utils.js';
 import type { SmartConnectionsLoader } from './smart-connections-loader.js';
+import type { OllamaClient } from './ollama-client.js';
 
 export type Granularity = 'note' | 'block';
+export type SearchMode = 'semantic' | 'keyword' | 'hybrid';
 
 export interface SearchOptions {
   threshold?: number;
@@ -40,11 +42,21 @@ export class SearchEngine {
   private loader: SmartConnectionsLoader;
   private active: ActiveModel;
   private vaultName?: string;
+  private ollama: OllamaClient | null;
 
-  constructor(loader: SmartConnectionsLoader, vaultName?: string) {
+  constructor(loader: SmartConnectionsLoader, vaultName?: string, ollama: OllamaClient | null = null) {
     this.loader = loader;
     this.active = loader.getActiveModel();
     this.vaultName = vaultName;
+    this.ollama = ollama;
+  }
+
+  setOllama(client: OllamaClient | null): void {
+    this.ollama = client;
+  }
+
+  hasSemantic(): boolean {
+    return this.ollama !== null;
   }
 
   // -----------------------------------------------------------------
@@ -124,17 +136,104 @@ export class SearchEngine {
   }
 
   // -----------------------------------------------------------------
-  // Keyword fallback for search_notes (phase 4 replaces with embed+cosine)
+  // Query search
   // -----------------------------------------------------------------
 
-  searchByQuery(queryText: string, limit = 10, threshold = 0.5): SimilarNote[] {
+  /**
+   * Unified query entry point.
+   *   - `semantic`: embed via Ollama → cosine at the requested granularity.
+   *     If Ollama is not configured, throws — caller can fall back.
+   *   - `keyword`: substring scoring over note bodies (note granularity).
+   *     Kept for BM25-flavoured recall and as Ollama-less fallback.
+   *   - `hybrid`: RRF fusion of the two ranked lists with k=60.
+   */
+  async searchByQuery(
+    queryText: string,
+    opts: {
+      mode?: SearchMode;
+      limit?: number;
+      threshold?: number;
+      granularity?: Granularity;
+      include_excerpt?: boolean;
+      excerpt_chars?: number;
+    } = {},
+  ): Promise<{ results: SimilarNote[]; mode: SearchMode; fallback_from?: SearchMode; warnings: string[] }> {
+    const mode: SearchMode = opts.mode ?? (this.ollama ? 'hybrid' : 'keyword');
+    const limit = opts.limit ?? 10;
+    const threshold = opts.threshold ?? 0.5;
+    const granularity: Granularity = opts.granularity ?? 'block';
+    const include_excerpt = opts.include_excerpt ?? true;
+    const excerpt_chars = opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS;
+    const warnings: string[] = [];
+
+    if ((mode === 'semantic' || mode === 'hybrid') && !this.ollama) {
+      if (mode === 'semantic') {
+        warnings.push('semantic requested but Ollama is not configured — falling back to keyword.');
+        return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: 'semantic', warnings };
+      }
+      warnings.push('hybrid requested but Ollama is not configured — using keyword only.');
+      return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: 'hybrid', warnings };
+    }
+
+    if (mode === 'keyword') {
+      return { results: this.searchKeyword(queryText, limit, threshold), mode, warnings };
+    }
+
+    // semantic or hybrid — need a query vector
+    let queryVec: number[];
+    try {
+      queryVec = await this.ollama!.embed(queryText);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(`Ollama embed failed: ${msg} — falling back to keyword.`);
+      return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: mode, warnings };
+    }
+
+    const semantic = this.rankByVector(queryVec, {
+      threshold: 0, // let RRF see full list; re-apply threshold at the end for pure-semantic
+      limit: Math.max(limit * 3, 30),
+      granularity,
+      include_excerpt,
+      excerpt_chars,
+    });
+
+    if (mode === 'semantic') {
+      return {
+        results: semantic.filter((r) => r.similarity >= threshold).slice(0, limit),
+        mode,
+        warnings,
+      };
+    }
+
+    // hybrid: RRF over semantic + keyword
+    const keyword = this.searchKeyword(queryText, Math.max(limit * 3, 30), 0);
+    const fused = rrfFuse(
+      [
+        { list: semantic, idOf: (h) => resultRefId(h) },
+        { list: keyword, idOf: (h) => resultRefId(h) },
+      ],
+      limit,
+    );
+    // Re-use the excerpt-enriched version from the semantic side when available,
+    // otherwise fall back to the keyword entry.
+    const semById = new Map(semantic.map((h) => [resultRefId(h), h] as const));
+    const results = fused.map(({ id, score }) => {
+      const hit = semById.get(id) ?? keyword.find((k) => resultRefId(k) === id)!;
+      return { ...hit, similarity: score };
+    });
+    return { results, mode, warnings };
+  }
+
+  /** Substring-frequency scorer. Note-level only. */
+  private searchKeyword(queryText: string, limit: number, threshold: number): SimilarNote[] {
     const results: SimilarNote[] = [];
     const queryLower = queryText.toLowerCase();
+    const re = new RegExp(escapeRegex(queryLower), 'gi');
 
     for (const [p, source] of this.loader.getSources()) {
       try {
         const content = this.loader.readNoteContent(p).toLowerCase();
-        const matches = (content.match(new RegExp(escapeRegex(queryLower), 'gi')) || []).length;
+        const matches = (content.match(re) || []).length;
         if (matches > 0) {
           const score = Math.min(matches / 10, 1.0);
           if (score >= threshold) {
@@ -147,10 +246,9 @@ export class SearchEngine {
           }
         }
       } catch {
-        // unreadable — ignore silently
+        /* unreadable — ignore */
       }
     }
-
     return results.sort((a, b) => b.similarity - a.similarity).slice(0, limit);
   }
 
@@ -391,6 +489,39 @@ function truncate(text: string, maxChars: number): { text: string; truncated: bo
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Stable identity for a hit, used to deduplicate across ranked lists in
+ * hybrid search. Block-level hits are keyed by `path#heading`, note-level
+ * by just `path`.
+ */
+function resultRefId(hit: SimilarNote): string {
+  return hit.heading ? `${hit.path}${hit.heading}` : hit.path;
+}
+
+/**
+ * Reciprocal Rank Fusion with k=60 (standard choice). Lists are already
+ * sorted by their own relevance. We return the top-N ids with their RRF
+ * scores in [0..~0.033]; callers typically replace similarity with this
+ * score for display.
+ */
+function rrfFuse(
+  lists: Array<{ list: SimilarNote[]; idOf: (h: SimilarNote) => string }>,
+  limit: number,
+  k = 60,
+): Array<{ id: string; score: number }> {
+  const scores = new Map<string, number>();
+  for (const { list, idOf } of lists) {
+    list.forEach((hit, rank) => {
+      const id = idOf(hit);
+      scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1));
+    });
+  }
+  return Array.from(scores.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([id, score]) => ({ id, score }));
 }
 
 // Unused imports kept-away from eslint-nopunctuation by referencing types.

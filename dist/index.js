@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { loadDotEnv } from './env-loader.js';
 import { SmartConnectionsLoader } from './smart-connections-loader.js';
 import { SearchEngine } from './search-engine.js';
+import { OllamaClient } from './ollama-client.js';
 // --------------------------------------------------------------- bootstrap
 const dotenv = loadDotEnv();
 if (dotenv.loaded) {
@@ -29,11 +30,45 @@ const VAULT_NAME = process.env.SMART_VAULT_NAME?.trim() ||
     (VAULT_PATH.split('/').filter(Boolean).pop() ?? 'vault');
 const loader = new SmartConnectionsLoader(VAULT_PATH);
 await loader.initialize();
-const searchEngine = new SearchEngine(loader, VAULT_NAME);
 const activeModel = loader.getActiveModel();
+// -- Optional semantic search via Ollama ------------------------------------
+// Opt-in: only enabled if OLLAMA_HOST is set (either explicitly or via the
+// embedding_models.ajson `host` for this model) AND DISABLE_SEMANTIC_SEARCH
+// is not "1". We probe the endpoint once and install the client only when
+// the dims match the vault — mismatched dims would silently destroy cosine
+// scoring, so we refuse that case.
+const semanticDisabled = process.env.DISABLE_SEMANTIC_SEARCH === '1';
+const ollamaHost = (process.env.OLLAMA_HOST ?? activeModel.host ?? '').trim();
+const ollamaModel = (process.env.OLLAMA_EMBED_MODEL ?? activeModel.model_key).trim();
+let ollamaClient = null;
+if (semanticDisabled) {
+    console.error('[smart-connections-mcp] semantic search disabled (DISABLE_SEMANTIC_SEARCH=1)');
+}
+else if (!ollamaHost) {
+    console.error('[smart-connections-mcp] semantic search: no OLLAMA_HOST and no host in embedding_models.ajson — using keyword only.');
+}
+else {
+    const probe = new OllamaClient({
+        host: ollamaHost,
+        model: ollamaModel,
+        expectedDims: activeModel.dims,
+    });
+    const health = await probe.health();
+    if (health.reachable && health.modelAvailable && health.dimsMatch) {
+        ollamaClient = probe;
+        console.error(`[smart-connections-mcp] semantic search: Ollama healthy — host="${ollamaHost}" model="${ollamaModel}" dims=${health.observedDims}`);
+    }
+    else {
+        console.error(`[smart-connections-mcp] semantic search: Ollama probe failed — reachable=${health.reachable} ` +
+            `modelAvailable=${health.modelAvailable} dimsMatch=${health.dimsMatch} ` +
+            `observedDims=${health.observedDims} error=${health.error ?? 'n/a'}`);
+    }
+}
+const searchEngine = new SearchEngine(loader, VAULT_NAME, ollamaClient);
 console.error(`[smart-connections-mcp] ready — vault="${VAULT_NAME}" path="${VAULT_PATH}" ` +
     `model="${activeModel.model_key}" dims=${activeModel.dims} ` +
-    `sources=${loader.getSources().size} blocks=${loader.getBlocks().size}`);
+    `sources=${loader.getSources().size} blocks=${loader.getBlocks().size} ` +
+    `semantic=${ollamaClient ? 'on' : 'off'}`);
 // ---------------------------------------------------------------- limits
 const MAX_NOTE_CONTENT_CHARS = 100_000;
 const MAX_EXCERPT_CHARS_CAP = 5_000;
@@ -67,6 +102,10 @@ const SearchNotesSchema = z.object({
     query: z.string().min(1).max(2000),
     limit: z.number().int().positive().max(MAX_LIMIT).default(10),
     threshold: z.number().min(0).max(1).default(0.5),
+    mode: z.enum(['semantic', 'keyword', 'hybrid']).optional(),
+    granularity: z.enum(['note', 'block']).default('block'),
+    include_excerpt: z.boolean().default(true),
+    excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(500),
 });
 const GetEmbeddingNeighborsSchema = z.object({
     embedding_vector: z.array(z.number()).min(1),
@@ -144,13 +183,17 @@ const tools = [
     },
     {
         name: 'search_notes',
-        description: 'KEYWORD substring search across indexed notes (NOT semantic). Returns notes ranked by raw match count. For semantic queries, use `get_similar_notes` or `get_embedding_neighbors`. A future version will add an opt-in Ollama-backed semantic mode.',
+        description: 'Search by a free-form query. Modes: "semantic" (embed via Ollama, cosine at block granularity by default), "keyword" (substring scoring over note bodies), "hybrid" (RRF fusion of both, k=60). Default is hybrid when Ollama is available, otherwise keyword. Hits carry the same reference packet as `get_similar_notes` (path, heading, lines, excerpt).',
         inputSchema: {
             type: 'object',
             properties: {
                 query: { type: 'string' },
+                mode: { type: 'string', enum: ['semantic', 'keyword', 'hybrid'], description: 'Default: hybrid if semantic is available, else keyword.' },
+                granularity: { type: 'string', enum: ['note', 'block'], default: 'block' },
                 limit: { type: 'number', minimum: 1, maximum: MAX_LIMIT, default: 10 },
                 threshold: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+                include_excerpt: { type: 'boolean', default: true },
+                excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: 500 },
             },
             required: ['query'],
         },
@@ -242,10 +285,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             case 'search_notes': {
                 const p = SearchNotesSchema.parse(args);
-                const results = searchEngine.searchByQuery(p.query, p.limit, p.threshold);
+                const out = await searchEngine.searchByQuery(p.query, {
+                    mode: p.mode,
+                    limit: p.limit,
+                    threshold: p.threshold,
+                    granularity: p.granularity,
+                    include_excerpt: p.include_excerpt,
+                    excerpt_chars: p.excerpt_chars,
+                });
                 return ok({
-                    meta: { ...baseMeta(), warnings: ['search_notes is KEYWORD substring matching — see tool description for semantic alternatives.'] },
-                    results,
+                    meta: {
+                        ...baseMeta(),
+                        search_mode: out.mode,
+                        fallback_from: out.fallback_from,
+                        warnings: out.warnings,
+                    },
+                    results: out.results,
                 });
             }
             case 'get_embedding_neighbors': {
@@ -296,6 +351,7 @@ function baseMeta() {
         vault_name: VAULT_NAME,
         model_key: activeModel.model_key,
         dims: activeModel.dims,
+        semantic_available: searchEngine.hasSemantic(),
     };
 }
 const transport = new StdioServerTransport();

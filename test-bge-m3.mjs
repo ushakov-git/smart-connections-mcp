@@ -8,6 +8,7 @@
 
 import { SmartConnectionsLoader } from './dist/smart-connections-loader.js';
 import { SearchEngine } from './dist/search-engine.js';
+import { OllamaClient } from './dist/ollama-client.js';
 
 const VAULT = process.env.TEST_VAULT_PATH ?? process.env.SMART_VAULT_PATH;
 if (!VAULT) {
@@ -139,5 +140,58 @@ let dimGuard = false;
 try { engine.getEmbeddingNeighbors([0.1, 0.2, 0.3], 5, 0.3); }
 catch (e) { dimGuard = /dims|expected/i.test(String(e.message)); }
 ok('getEmbeddingNeighbors rejects wrong-dim vector', dimGuard);
+
+// -------- Phase 4: semantic / hybrid search_notes --------
+const ollamaHost = process.env.OLLAMA_HOST ?? active.host ?? 'http://127.0.0.1:11434';
+const ollamaModel = process.env.OLLAMA_EMBED_MODEL ?? active.model_key;
+
+const probe = new OllamaClient({ host: ollamaHost, model: ollamaModel, expectedDims: active.dims });
+const health = await probe.health();
+console.log(`\n[ollama] ${ollamaHost} model=${ollamaModel} reachable=${health.reachable} modelAvailable=${health.modelAvailable} dimsMatch=${health.dimsMatch}`);
+
+// Keyword mode always works (no Ollama).
+const engineNoOllama = new SearchEngine(loader, VAULT_NAME, null);
+const kwOut = await engineNoOllama.searchByQuery('Mastra', { mode: 'keyword', limit: 3, threshold: 0.1 });
+ok('keyword mode returns results', kwOut.results.length > 0, `top="${kwOut.results[0]?.path}"`);
+ok('keyword mode reports mode=keyword', kwOut.mode === 'keyword');
+
+// When Ollama is not configured, requesting semantic falls back to keyword with a warning.
+const fbOut = await engineNoOllama.searchByQuery('Mastra', { mode: 'semantic', limit: 3, threshold: 0.1 });
+ok('semantic without ollama falls back to keyword', fbOut.mode === 'keyword' && fbOut.fallback_from === 'semantic');
+ok('fallback emits a warning', Array.isArray(fbOut.warnings) && fbOut.warnings.length > 0);
+
+if (health.reachable && health.modelAvailable && health.dimsMatch) {
+  const engineOllama = new SearchEngine(loader, VAULT_NAME, probe);
+
+  // Semantic, block granularity.
+  const semOut = await engineOllama.searchByQuery('observability и трейсинг агентов Mastra', {
+    mode: 'semantic',
+    granularity: 'block',
+    limit: 5,
+    threshold: 0.3,
+  });
+  ok('semantic returns hits', semOut.results.length > 0, `mode=${semOut.mode} top="${semOut.results[0]?.path}" sim=${semOut.results[0]?.similarity?.toFixed(3)}`);
+  ok('semantic hit has heading (block granularity)', Boolean(semOut.results[0]?.heading));
+  ok('semantic hit has excerpt', typeof semOut.results[0]?.excerpt === 'string' && semOut.results[0].excerpt.length > 0);
+
+  // Hybrid mode.
+  const hyOut = await engineOllama.searchByQuery('observability и трейсинг агентов Mastra', {
+    mode: 'hybrid',
+    limit: 5,
+    threshold: 0,
+  });
+  ok('hybrid returns hits', hyOut.results.length > 0, `mode=${hyOut.mode} top="${hyOut.results[0]?.path}"`);
+
+  // Cache warmup test.
+  const t1 = Date.now();
+  await probe.embed('повторяющийся запрос');
+  const cold = Date.now() - t1;
+  const t2 = Date.now();
+  await probe.embed('повторяющийся запрос');
+  const warm = Date.now() - t2;
+  ok('ollama LRU cache speeds up repeated query', warm < cold, `cold=${cold}ms warm=${warm}ms`);
+} else {
+  console.log('[SKIP] ollama-backed semantic tests (host unreachable or dims mismatch)');
+}
 
 console.log(`\n=== ${results.filter(r => r.cond).length}/${results.length} passed ===`);

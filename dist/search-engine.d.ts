@@ -15,7 +15,9 @@
 import type { SimilarNote, ConnectionGraph, NoteContent } from './types.js';
 import { cosineSimilarity } from './embedding-utils.js';
 import type { SmartConnectionsLoader } from './smart-connections-loader.js';
+import type { OllamaClient } from './ollama-client.js';
 export type Granularity = 'note' | 'block';
+export type SearchMode = 'semantic' | 'keyword' | 'hybrid';
 export interface SearchOptions {
     threshold?: number;
     limit?: number;
@@ -27,7 +29,10 @@ export declare class SearchEngine {
     private loader;
     private active;
     private vaultName?;
-    constructor(loader: SmartConnectionsLoader, vaultName?: string);
+    private ollama;
+    constructor(loader: SmartConnectionsLoader, vaultName?: string, ollama?: OllamaClient | null);
+    setOllama(client: OllamaClient | null): void;
+    hasSemantic(): boolean;
     /**
      * Find items similar to the embedding of an existing note. Granularity
      * selects what populates the result set — blocks give heading-scoped
@@ -37,7 +42,29 @@ export declare class SearchEngine {
     /** Find blocks similar to an existing block identified by `path#heading-chain`. */
     getSimilarBlocks(blockKey: string, threshold?: number, limit?: number, opts?: Omit<SearchOptions, 'threshold' | 'limit' | 'granularity'>): SimilarNote[];
     getEmbeddingNeighbors(embeddingVector: number[], k?: number, threshold?: number, opts?: Omit<SearchOptions, 'threshold' | 'limit'>): SimilarNote[];
-    searchByQuery(queryText: string, limit?: number, threshold?: number): SimilarNote[];
+    /**
+     * Unified query entry point.
+     *   - `semantic`: embed via Ollama → cosine at the requested granularity.
+     *     If Ollama is not configured, throws — caller can fall back.
+     *   - `keyword`: substring scoring over note bodies (note granularity).
+     *     Kept for BM25-flavoured recall and as Ollama-less fallback.
+     *   - `hybrid`: RRF fusion of the two ranked lists with k=60.
+     */
+    searchByQuery(queryText: string, opts?: {
+        mode?: SearchMode;
+        limit?: number;
+        threshold?: number;
+        granularity?: Granularity;
+        include_excerpt?: boolean;
+        excerpt_chars?: number;
+    }): Promise<{
+        results: SimilarNote[];
+        mode: SearchMode;
+        fallback_from?: SearchMode;
+        warnings: string[];
+    }>;
+    /** Substring-frequency scorer. Note-level only. */
+    private searchKeyword;
     getNoteWithContext(notePath: string, _includeBlocks?: string[]): NoteContent;
     /**
      * Extract a single block's markdown content. Accepts either the

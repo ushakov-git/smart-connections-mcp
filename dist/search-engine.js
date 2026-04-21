@@ -18,10 +18,18 @@ export class SearchEngine {
     loader;
     active;
     vaultName;
-    constructor(loader, vaultName) {
+    ollama;
+    constructor(loader, vaultName, ollama = null) {
         this.loader = loader;
         this.active = loader.getActiveModel();
         this.vaultName = vaultName;
+        this.ollama = ollama;
+    }
+    setOllama(client) {
+        this.ollama = client;
+    }
+    hasSemantic() {
+        return this.ollama !== null;
     }
     // -----------------------------------------------------------------
     // Similar (by existing note or block)
@@ -81,15 +89,83 @@ export class SearchEngine {
         });
     }
     // -----------------------------------------------------------------
-    // Keyword fallback for search_notes (phase 4 replaces with embed+cosine)
+    // Query search
     // -----------------------------------------------------------------
-    searchByQuery(queryText, limit = 10, threshold = 0.5) {
+    /**
+     * Unified query entry point.
+     *   - `semantic`: embed via Ollama → cosine at the requested granularity.
+     *     If Ollama is not configured, throws — caller can fall back.
+     *   - `keyword`: substring scoring over note bodies (note granularity).
+     *     Kept for BM25-flavoured recall and as Ollama-less fallback.
+     *   - `hybrid`: RRF fusion of the two ranked lists with k=60.
+     */
+    async searchByQuery(queryText, opts = {}) {
+        const mode = opts.mode ?? (this.ollama ? 'hybrid' : 'keyword');
+        const limit = opts.limit ?? 10;
+        const threshold = opts.threshold ?? 0.5;
+        const granularity = opts.granularity ?? 'block';
+        const include_excerpt = opts.include_excerpt ?? true;
+        const excerpt_chars = opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS;
+        const warnings = [];
+        if ((mode === 'semantic' || mode === 'hybrid') && !this.ollama) {
+            if (mode === 'semantic') {
+                warnings.push('semantic requested but Ollama is not configured — falling back to keyword.');
+                return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: 'semantic', warnings };
+            }
+            warnings.push('hybrid requested but Ollama is not configured — using keyword only.');
+            return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: 'hybrid', warnings };
+        }
+        if (mode === 'keyword') {
+            return { results: this.searchKeyword(queryText, limit, threshold), mode, warnings };
+        }
+        // semantic or hybrid — need a query vector
+        let queryVec;
+        try {
+            queryVec = await this.ollama.embed(queryText);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            warnings.push(`Ollama embed failed: ${msg} — falling back to keyword.`);
+            return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: mode, warnings };
+        }
+        const semantic = this.rankByVector(queryVec, {
+            threshold: 0, // let RRF see full list; re-apply threshold at the end for pure-semantic
+            limit: Math.max(limit * 3, 30),
+            granularity,
+            include_excerpt,
+            excerpt_chars,
+        });
+        if (mode === 'semantic') {
+            return {
+                results: semantic.filter((r) => r.similarity >= threshold).slice(0, limit),
+                mode,
+                warnings,
+            };
+        }
+        // hybrid: RRF over semantic + keyword
+        const keyword = this.searchKeyword(queryText, Math.max(limit * 3, 30), 0);
+        const fused = rrfFuse([
+            { list: semantic, idOf: (h) => resultRefId(h) },
+            { list: keyword, idOf: (h) => resultRefId(h) },
+        ], limit);
+        // Re-use the excerpt-enriched version from the semantic side when available,
+        // otherwise fall back to the keyword entry.
+        const semById = new Map(semantic.map((h) => [resultRefId(h), h]));
+        const results = fused.map(({ id, score }) => {
+            const hit = semById.get(id) ?? keyword.find((k) => resultRefId(k) === id);
+            return { ...hit, similarity: score };
+        });
+        return { results, mode, warnings };
+    }
+    /** Substring-frequency scorer. Note-level only. */
+    searchKeyword(queryText, limit, threshold) {
         const results = [];
         const queryLower = queryText.toLowerCase();
+        const re = new RegExp(escapeRegex(queryLower), 'gi');
         for (const [p, source] of this.loader.getSources()) {
             try {
                 const content = this.loader.readNoteContent(p).toLowerCase();
-                const matches = (content.match(new RegExp(escapeRegex(queryLower), 'gi')) || []).length;
+                const matches = (content.match(re) || []).length;
                 if (matches > 0) {
                     const score = Math.min(matches / 10, 1.0);
                     if (score >= threshold) {
@@ -103,7 +179,7 @@ export class SearchEngine {
                 }
             }
             catch {
-                // unreadable — ignore silently
+                /* unreadable — ignore */
             }
         }
         return results.sort((a, b) => b.similarity - a.similarity).slice(0, limit);
@@ -311,6 +387,33 @@ function truncate(text, maxChars) {
 }
 function escapeRegex(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+/**
+ * Stable identity for a hit, used to deduplicate across ranked lists in
+ * hybrid search. Block-level hits are keyed by `path#heading`, note-level
+ * by just `path`.
+ */
+function resultRefId(hit) {
+    return hit.heading ? `${hit.path}${hit.heading}` : hit.path;
+}
+/**
+ * Reciprocal Rank Fusion with k=60 (standard choice). Lists are already
+ * sorted by their own relevance. We return the top-N ids with their RRF
+ * scores in [0..~0.033]; callers typically replace similarity with this
+ * score for display.
+ */
+function rrfFuse(lists, limit, k = 60) {
+    const scores = new Map();
+    for (const { list, idOf } of lists) {
+        list.forEach((hit, rank) => {
+            const id = idOf(hit);
+            scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1));
+        });
+    }
+    return Array.from(scores.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, limit)
+        .map(([id, score]) => ({ id, score }));
 }
 // cosineSimilarity is re-exported because older callers imported it from here.
 export { cosineSimilarity };
