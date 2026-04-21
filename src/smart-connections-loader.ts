@@ -21,6 +21,17 @@ import type { SmartSource, SmartBlock, SmartEnvConfig, ActiveModel } from './typ
 import { parseAjsonLines } from './ajson-parser.js';
 import { EmbeddingModelsLoader } from './embedding-models-loader.js';
 
+const ALLOWED_EXTENSIONS = new Set(['.md', '.markdown', '.canvas']);
+
+function assertAllowedExtension(notePath: string): void {
+  const ext = path.extname(notePath).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    throw new Error(
+      `File extension "${ext || '(none)'}" is not permitted; allowed: ${Array.from(ALLOWED_EXTENSIONS).join(', ')}`,
+    );
+  }
+}
+
 export interface LoadStats {
   sourceFilesScanned: number;
   sourcesKept: number;
@@ -393,10 +404,15 @@ export class SmartConnectionsLoader {
   /**
    * Read a markdown note's content. `notePath` is vault-relative.
    * Path-traversal containment is enforced: the resolved target must lie
-   * strictly within the vault root (symlinks resolved).
+   * strictly within the vault root (symlinks resolved). Only notebook-like
+   * files are served (`.md`, `.markdown`, `.canvas`) — the server has no
+   * legitimate reason to read arbitrary file types, and this whitelist
+   * defangs a hypothetical prompt-injection that asks for
+   * `.env`/`.zshrc`/etc. even if they happen to live inside the vault.
    */
   readNoteContent(notePath: string): string {
     const full = this.resolveInsideVault(notePath);
+    assertAllowedExtension(notePath);
     return fs.readFileSync(full, 'utf-8');
   }
 

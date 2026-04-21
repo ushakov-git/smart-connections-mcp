@@ -8,8 +8,9 @@ yarn-error.log*
 # TypeScript
 *.tsbuildinfo
 
-# Build files - Keep dist/ for distribution
+# Build artefacts — rebuild with `npm run build`, don't commit them.
 build/
+dist/
 *.js.map
 
 # Environment variables

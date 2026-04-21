@@ -121,13 +121,19 @@ if (samplePath) {
 // Path-traversal defenses.
 let traversalBlocked = false;
 try { loader.readNoteContent('../../../etc/passwd'); }
-catch (e) { traversalBlocked = /escapes|relative|not found/i.test(String(e.message)); }
+catch (e) { traversalBlocked = /escapes|relative|not found|extension/i.test(String(e.message)); }
 ok('readNoteContent blocks ../ traversal', traversalBlocked);
 
 let absBlocked = false;
 try { loader.readNoteContent('/etc/passwd'); }
-catch (e) { absBlocked = /absolute|escapes/i.test(String(e.message)); }
+catch (e) { absBlocked = /absolute|escapes|extension/i.test(String(e.message)); }
 ok('readNoteContent blocks absolute paths', absBlocked);
+
+// Extension whitelist.
+let extBlocked = false;
+try { loader.readNoteContent('some-file.yaml'); }
+catch (e) { extBlocked = /extension|not permitted|not found/i.test(String(e.message)); }
+ok('readNoteContent blocks non-whitelisted extensions', extBlocked);
 
 // Bad block_key rejected.
 let badKeyRejected = false;
