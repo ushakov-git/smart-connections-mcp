@@ -9,6 +9,9 @@
 import { SmartConnectionsLoader } from './dist/smart-connections-loader.js';
 import { SearchEngine } from './dist/search-engine.js';
 import { OllamaClient } from './dist/ollama-client.js';
+import { VaultWatcher } from './dist/vault-watcher.js';
+import fs from 'fs';
+import path from 'path';
 
 const VAULT = process.env.TEST_VAULT_PATH ?? process.env.SMART_VAULT_PATH;
 if (!VAULT) {
@@ -199,5 +202,36 @@ if (health.reachable && health.modelAvailable && health.dimsMatch) {
 } else {
   console.log('[SKIP] ollama-backed semantic tests (host unreachable or dims mismatch)');
 }
+
+// -------- Phase 5: incremental reload + watcher lifecycle --------
+// Re-ingest an existing .ajson file through reloadMultiFile — no mutation
+// of the user's vault happens; the file content on disk is unchanged, but
+// the loader path still exercises the same ingest code.
+const multiDir = path.join(VAULT, '.smart-env', 'multi');
+const anyAjson = fs.readdirSync(multiDir).find((f) => f.endsWith('.ajson'));
+if (anyAjson) {
+  const prior = { sources: loader.getSources().size, blocks: loader.getBlocks().size };
+  const deltas = loader.reloadMultiFile(anyAjson);
+  ok('reloadMultiFile runs without throwing', typeof deltas.updatedSources === 'number' && typeof deltas.updatedBlocks === 'number');
+  ok('index sizes stable after idempotent reload', loader.getSources().size === prior.sources && loader.getBlocks().size === prior.blocks,
+     `before=${JSON.stringify(prior)} after sources=${loader.getSources().size} blocks=${loader.getBlocks().size}`);
+}
+
+// Watcher lifecycle — start, stop, no throws, no handlers pending.
+const watcher = new VaultWatcher(loader, { debounceMs: 50, log: () => {} });
+let started = false;
+try { watcher.start(); started = true; } catch {}
+ok('VaultWatcher.start() does not throw', started);
+// give it a moment to register handles, then stop.
+await new Promise((r) => setTimeout(r, 100));
+let stopped = false;
+try { watcher.stop(); stopped = true; } catch {}
+ok('VaultWatcher.stop() does not throw', stopped);
+
+// fullReload — clears and rebuilds; final counts must match prior state.
+const beforeFull = { sources: loader.getSources().size, blocks: loader.getBlocks().size };
+loader.fullReload();
+ok('fullReload recovers source count', loader.getSources().size === beforeFull.sources, `before=${beforeFull.sources} after=${loader.getSources().size}`);
+ok('fullReload recovers block count', loader.getBlocks().size === beforeFull.blocks, `before=${beforeFull.blocks} after=${loader.getBlocks().size}`);
 
 console.log(`\n=== ${results.filter(r => r.cond).length}/${results.length} passed ===`);

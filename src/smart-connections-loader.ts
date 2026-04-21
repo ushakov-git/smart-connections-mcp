@@ -402,6 +402,71 @@ export class SmartConnectionsLoader {
   }
 
   /**
+   * Re-read a single `multi/*.ajson` file and merge its entries into the
+   * current index. Used by the watcher when Smart Connections rewrites an
+   * entry after re-embedding. Silently no-ops if the file no longer exists.
+   *
+   * This does not remove stale entries whose path/compound-key is absent
+   * from the file — the plugin's append-friendly format means deletions
+   * are rare and would normally arrive as a file rewrite elsewhere. A
+   * full reload covers that case.
+   */
+  reloadMultiFile(fileName: string): { updatedSources: number; updatedBlocks: number } {
+    if (!this.active) throw new Error('reloadMultiFile called before initialize()');
+    const filePath = path.join(this.smartEnvPath, 'multi', fileName);
+    if (!fs.existsSync(filePath)) return { updatedSources: 0, updatedBlocks: 0 };
+
+    const before = { sources: this.sources.size, blocks: this.blocks.size };
+    let srcChanged = 0;
+    let blkChanged = 0;
+
+    const content = fs.readFileSync(filePath, 'utf-8');
+    parseAjsonLines(
+      content,
+      (key, value) => {
+        if (key.startsWith('smart_sources:')) {
+          const pathBefore = (value as SmartSource | null)?.path;
+          const had = pathBefore ? this.sources.has(pathBefore) : false;
+          this.ingestSource(value);
+          if (pathBefore && (!had || this.sources.get(pathBefore) === value)) srcChanged += 1;
+        } else if (key.startsWith('smart_blocks:')) {
+          const compound = key.slice('smart_blocks:'.length);
+          const had = this.blocks.has(compound);
+          this.ingestBlock(compound, value);
+          if (!had || this.blocks.get(compound)) blkChanged += 1;
+        }
+      },
+      { onError: () => (this.stats.parseErrors += 1) },
+    );
+
+    // Crude "updated" metric — counts entries we touched, not net delta.
+    // For diagnostics only.
+    void before;
+    return { updatedSources: srcChanged, updatedBlocks: blkChanged };
+  }
+
+  /** Full reload — scan all multi/*.ajson again, rebuilding indexes. */
+  fullReload(): void {
+    this.sources.clear();
+    this.blocks.clear();
+    this.blocksBySource.clear();
+    this.stats.sourcesKept = 0;
+    this.stats.sourcesReplaced = 0;
+    this.stats.sourcesSkippedNoEmbedding = 0;
+    this.stats.sourcesSkippedNullPath = 0;
+    this.stats.blocksKept = 0;
+    this.stats.blocksReplaced = 0;
+    this.stats.blocksSkippedNoEmbedding = 0;
+    this.stats.blocksSkippedBadKey = 0;
+    this.stats.parseErrors = 0;
+    this.stats.sourceFilesScanned = 0;
+    this.embeddingModels = new EmbeddingModelsLoader(this.smartEnvPath);
+    this.embeddingModels.load();
+    this.loadSources();
+    this.finalizeDims();
+  }
+
+  /**
    * Read a markdown note's content. `notePath` is vault-relative.
    * Path-traversal containment is enforced: the resolved target must lie
    * strictly within the vault root (symlinks resolved). Only notebook-like

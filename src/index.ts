@@ -21,6 +21,7 @@ import { loadDotEnv } from './env-loader.js';
 import { SmartConnectionsLoader } from './smart-connections-loader.js';
 import { SearchEngine } from './search-engine.js';
 import { OllamaClient } from './ollama-client.js';
+import { VaultWatcher } from './vault-watcher.js';
 
 // --------------------------------------------------------------- bootstrap
 
@@ -414,6 +415,46 @@ function baseMeta() {
     semantic_available: searchEngine.hasSemantic(),
   };
 }
+
+// ---------------------------------------------------------------- watcher
+
+const watcherEnabled = process.env.DISABLE_WATCHER !== '1';
+let watcher: VaultWatcher | null = null;
+if (watcherEnabled) {
+  watcher = new VaultWatcher(loader, {
+    onReload: (file, { updatedSources, updatedBlocks }) => {
+      console.error(
+        `[watcher] reloaded ${file}: sources+${updatedSources} blocks+${updatedBlocks}` +
+          ` (totals sources=${loader.getSources().size} blocks=${loader.getBlocks().size})`,
+      );
+    },
+    onFullReload: () => {
+      console.error(
+        `[watcher] full reload complete (sources=${loader.getSources().size} blocks=${loader.getBlocks().size})`,
+      );
+    },
+  });
+  watcher.start();
+} else {
+  console.error('[smart-connections-mcp] watcher disabled (DISABLE_WATCHER=1)');
+}
+
+// ---------------------------------------------------------------- shutdown
+
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[smart-connections-mcp] received ${signal} — shutting down`);
+  try { watcher?.stop(); } catch { /* ignore */ }
+  try { await server.close(); } catch { /* ignore */ }
+  // StdioServerTransport closes with the server; nothing else to release.
+  process.exit(0);
+}
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+
+// ---------------------------------------------------------------- start
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
