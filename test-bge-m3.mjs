@@ -421,4 +421,113 @@ if (anyBlockKey) {
   }
 }
 
+// -------- v2.2.1: response-size knobs, error message, expand modes --------
+
+// `Block not found` — unified error on a heading that does not exist.
+if (samplePath) {
+  let matched = false;
+  try {
+    engine.getBlockContent({ path: samplePath, heading: '#definitely-not-a-heading-9f3c7a' });
+  } catch (e) {
+    matched = /^Block not found:/.test(String(e.message ?? e));
+  }
+  ok('errors: get_block_content throws "Block not found: ..." on miss', matched);
+}
+
+// include_blocks_list: false (default) suppresses `blocks[]` on note-granularity hits.
+if (samplePath) {
+  const hits = engine.getSimilarNotes(samplePath, 0.3, 3, {
+    granularity: 'note',
+    include_excerpt: false,
+  });
+  const any = hits[0];
+  ok('blocks-list: default omits `blocks[]` on note-granularity hit',
+     any && !('blocks' in any) && !('blocks_truncated' in any),
+     `has_blocks=${any && 'blocks' in any}`);
+}
+
+// include_blocks_list: true + max_blocks_per_hit cap.
+if (samplePath) {
+  const hits = engine.getSimilarNotes(samplePath, 0.3, 3, {
+    granularity: 'note',
+    include_excerpt: false,
+    include_blocks_list: true,
+    max_blocks_per_hit: 2,
+  });
+  const first = hits.find((h) => Array.isArray(h.blocks));
+  if (first) {
+    ok('blocks-list: explicit opt-in returns `blocks[]`',
+       Array.isArray(first.blocks) && first.blocks.length <= 2,
+       `blocks_len=${first.blocks.length}`);
+    ok('blocks-list: reports total_blocks_in_note when opted in',
+       typeof first.total_blocks_in_note === 'number' && first.total_blocks_in_note >= first.blocks.length);
+    if ((first.total_blocks_in_note ?? 0) > first.blocks.length) {
+      ok('blocks-list: blocks_truncated=true when capped', first.blocks_truncated === true);
+    }
+  }
+}
+
+// getNoteWithContext: include_blocks_list=false path — no `blocks` key returned.
+if (samplePath) {
+  const r = engine.getNoteWithContext(samplePath, [], { include_blocks_list: false });
+  ok('get_note_content: include_blocks_list=false drops `blocks[]`',
+     r.blocks === undefined && typeof r.total_blocks_in_note === 'number',
+     `total_blocks_in_note=${r.total_blocks_in_note}`);
+}
+
+// getNoteWithContext: max_blocks truncation.
+if (samplePath) {
+  const r = engine.getNoteWithContext(samplePath, [], { max_blocks: 1 });
+  if ((r.total_blocks_in_note ?? 0) > 1) {
+    ok('get_note_content: max_blocks truncates `blocks[]`',
+       Array.isArray(r.blocks) && r.blocks.length === 1 && r.blocks_truncated === true,
+       `len=${r.blocks?.length} total=${r.total_blocks_in_note}`);
+  } else {
+    ok('get_note_content: max_blocks no-ops when total ≤ cap',
+       r.blocks_truncated === false,
+       `total=${r.total_blocks_in_note}`);
+  }
+}
+
+// Expand mode "always": every expandable block hit is expanded, even below the similarity threshold.
+if (anyBlockKey) {
+  const out = engine.getSimilarBlocks(anyBlockKey, 0, 5, {
+    include_excerpt: false,
+    expand_to_section: 'always',
+    deduplicate_by_section: false,
+  });
+  const withExpansion = out.filter((h) => h.expansion);
+  const appliedOrSkipped = withExpansion.every(
+    (h) => h.expansion.applied === true || h.expansion.reason === 'parent block not in index',
+  );
+  ok('expand: "always" expands every block hit with a parent (or reports parent-missing)',
+     withExpansion.length > 0 && appliedOrSkipped,
+     `hits=${out.length} with_expansion=${withExpansion.length}`);
+}
+
+// DISABLE_SEMANTIC_SEARCH fallback: constructing an engine without Ollama
+// and requesting hybrid/semantic should fall back to keyword cleanly.
+{
+  const engineNoSem = new SearchEngine(loader, VAULT_NAME, null);
+  const out = await engineNoSem.searchByQuery('Mastra', { mode: 'hybrid', limit: 2, threshold: 0.1 });
+  ok('semantic-off: hybrid falls back to keyword when Ollama is disabled',
+     out.mode === 'keyword' && out.fallback_from === 'hybrid' && out.warnings.length > 0);
+  ok('semantic-off: keyword results still usable', out.results.length > 0);
+}
+
+// Path-traversal guard: three classes of escapes must be rejected.
+{
+  const cases = [
+    ['..-escape', '../outside.md'],
+    ['abs-path', '/etc/hosts'],
+    ['non-whitelisted ext', 'something.yaml'],
+  ];
+  for (const [label, attempt] of cases) {
+    let blocked = false;
+    try { loader.readNoteContent(attempt); }
+    catch (e) { blocked = /escapes|relative|absolute|extension|not permitted|not found/i.test(String(e.message)); }
+    ok(`path-guard: blocks ${label}`, blocked, `attempt="${attempt}"`);
+  }
+}
+
 console.log(`\n=== ${results.filter(r => r.cond).length}/${results.length} passed ===`);
