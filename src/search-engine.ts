@@ -20,6 +20,7 @@ import type {
   ConnectionGraph,
   NoteContent,
   ActiveModel,
+  HitExpansion,
 } from './types.js';
 import { cosineSimilarity, findNearestNeighbors } from './embedding-utils.js';
 import type { SmartConnectionsLoader } from './smart-connections-loader.js';
@@ -27,8 +28,36 @@ import type { OllamaClient } from './ollama-client.js';
 
 export type Granularity = 'note' | 'block';
 export type SearchMode = 'semantic' | 'keyword' | 'hybrid';
+export type ExpandMode = 'never' | 'high-similarity' | 'always';
 
-export interface SearchOptions {
+/**
+ * Post-processing knobs applied to ranked hits before returning.
+ *
+ * `deduplicate_by_section` groups block-level hits that share the same
+ * `##`- (or `###`-) ancestor: the best-similarity hit is kept, the rest
+ * move into that hit's `sibling_matches`.
+ *
+ * `expand_to_section` upgrades a hit's payload by reading the full
+ * markdown of a parent section:
+ *   - in `"high-similarity"` mode we expand when similarity ≥
+ *     `expand_threshold`, OR when the heading ends with a `#{N}`
+ *     fragment suffix (those are almost always topic-phrases without
+ *     enough content in the excerpt).
+ *   - in `"always"` we expand every block-level hit.
+ *   - in `"never"` we leave the payload unchanged.
+ *
+ * Both features are opt-in. They apply to block-level hits only; note
+ * granularity is passed through unchanged.
+ */
+export interface HitPostProcessOptions {
+  expand_to_section?: ExpandMode;
+  expand_threshold?: number;
+  expand_max_chars?: number;
+  deduplicate_by_section?: boolean;
+  dedup_level?: 2 | 3;
+}
+
+export interface SearchOptions extends HitPostProcessOptions {
   threshold?: number;
   limit?: number;
   granularity?: Granularity;
@@ -37,6 +66,12 @@ export interface SearchOptions {
 }
 
 const DEFAULT_EXCERPT_CHARS = 1_500;
+const DEFAULT_EXPAND_THRESHOLD = 0.8;
+const DEFAULT_EXPAND_MAX_CHARS = 5_000;
+const DEFAULT_DEDUP_LEVEL: 2 | 3 = 2;
+const DEFAULT_EXPAND_MODE: ExpandMode = 'high-similarity';
+const DEFAULT_DEDUP_ENABLED = true;
+const DEDUP_FETCH_MULTIPLIER = 3;
 
 /**
  * Tunable parameters of the hybrid Reciprocal Rank Fusion step.
@@ -118,14 +153,16 @@ export class SearchEngine {
     if (!queryVec || queryVec.length === 0) {
       throw new Error(`No embedding for note under active model "${this.active.model_key}": ${notePath}`);
     }
-    return this.rankByVector(queryVec, {
+    const granularity = opts.granularity ?? 'block';
+    const raw = this.rankByVector(queryVec, {
       threshold,
-      limit,
-      granularity: opts.granularity ?? 'block',
+      limit: overFetchLimit(limit, granularity, opts),
+      granularity,
       include_excerpt: opts.include_excerpt ?? true,
       excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
       excludePath: notePath,
     });
+    return this.postProcessHits(raw, limit, { ...opts, granularity });
   }
 
   /** Find blocks similar to an existing block identified by `path#heading-chain`. */
@@ -139,14 +176,15 @@ export class SearchEngine {
     if (!block) throw new Error(`Block not found: ${blockKey}`);
     const queryVec = block.embeddings[this.active.model_key]?.vec;
     if (!queryVec) throw new Error(`No embedding for block under active model: ${blockKey}`);
-    return this.rankByVector(queryVec, {
+    const raw = this.rankByVector(queryVec, {
       threshold,
-      limit,
+      limit: overFetchLimit(limit, 'block', opts),
       granularity: 'block',
       include_excerpt: opts.include_excerpt ?? true,
       excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
       excludeBlockKey: blockKey,
     });
+    return this.postProcessHits(raw, limit, { ...opts, granularity: 'block' });
   }
 
   // -----------------------------------------------------------------
@@ -164,13 +202,15 @@ export class SearchEngine {
         `embedding_vector has ${embeddingVector.length} dims, expected ${this.active.dims} (model: ${this.active.model_key})`,
       );
     }
-    return this.rankByVector(embeddingVector, {
+    const granularity = opts.granularity ?? 'block';
+    const raw = this.rankByVector(embeddingVector, {
       threshold,
-      limit: k,
-      granularity: opts.granularity ?? 'block',
+      limit: overFetchLimit(k, granularity, opts),
+      granularity,
       include_excerpt: opts.include_excerpt ?? true,
       excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
     });
+    return this.postProcessHits(raw, k, { ...opts, granularity });
   }
 
   // -----------------------------------------------------------------
@@ -194,7 +234,7 @@ export class SearchEngine {
       granularity?: Granularity;
       include_excerpt?: boolean;
       excerpt_chars?: number;
-    } = {},
+    } & HitPostProcessOptions = {},
   ): Promise<{ results: SimilarNote[]; mode: SearchMode; fallback_from?: SearchMode; warnings: string[] }> {
     const mode: SearchMode = opts.mode ?? (this.ollama ? 'hybrid' : 'keyword');
     const limit = opts.limit ?? 10;
@@ -207,14 +247,17 @@ export class SearchEngine {
     if ((mode === 'semantic' || mode === 'hybrid') && !this.ollama) {
       if (mode === 'semantic') {
         warnings.push('semantic requested but Ollama is not configured — falling back to keyword.');
-        return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: 'semantic', warnings };
+        const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+        return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode: 'keyword', fallback_from: 'semantic', warnings };
       }
       warnings.push('hybrid requested but Ollama is not configured — using keyword only.');
-      return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: 'hybrid', warnings };
+      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+      return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode: 'keyword', fallback_from: 'hybrid', warnings };
     }
 
     if (mode === 'keyword') {
-      return { results: this.searchKeyword(queryText, limit, threshold), mode, warnings };
+      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+      return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode, warnings };
     }
 
     // semantic or hybrid — need a query vector
@@ -224,41 +267,48 @@ export class SearchEngine {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`Ollama embed failed: ${msg} — falling back to keyword.`);
-      return { results: this.searchKeyword(queryText, limit, threshold), mode: 'keyword', fallback_from: mode, warnings };
+      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+      return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode: 'keyword', fallback_from: mode, warnings };
     }
 
+    // Always overfetch for semantic — we need headroom for RRF and for
+    // dedup/expand post-processing regardless of whether it's requested.
+    const overLimit = Math.max(limit * 3, 30);
     const semantic = this.rankByVector(queryVec, {
       threshold: 0, // let RRF see full list; re-apply threshold at the end for pure-semantic
-      limit: Math.max(limit * 3, 30),
+      limit: overLimit,
       granularity,
       include_excerpt,
       excerpt_chars,
     });
 
     if (mode === 'semantic') {
-      return {
-        results: semantic.filter((r) => r.similarity >= threshold).slice(0, limit),
-        mode,
-        warnings,
-      };
+      const filtered = semantic.filter((r) => r.similarity >= threshold);
+      return { results: this.postProcessHits(filtered, limit, { ...opts, granularity }), mode, warnings };
     }
 
     // hybrid: weighted RRF over semantic + keyword
-    const keyword = this.searchKeyword(queryText, Math.max(limit * 3, 30), 0);
+    const keyword = this.searchKeyword(queryText, overLimit, 0);
     const fused = rrfFuse(
       [
         { list: semantic, idOf: (h) => resultRefId(h), weight: this.fusion.semantic_weight },
         { list: keyword, idOf: (h) => resultRefId(h), weight: this.fusion.keyword_weight },
       ],
-      limit,
+      overLimit, // keep headroom for post-processing
       this.fusion.k,
     );
-    // Re-use the excerpt-enriched version from the semantic side when available,
-    // otherwise fall back to the keyword entry.
+    // Build a semantic-cosine map so that expand decisions in hybrid still
+    // reference the cosine scale, not the RRF score.
+    const cosineById = new Map(semantic.map((h) => [resultRefId(h), h.similarity] as const));
     const semById = new Map(semantic.map((h) => [resultRefId(h), h] as const));
-    const results = fused.map(({ id, score }) => {
+    const fusedHits = fused.map(({ id, score }) => {
       const hit = semById.get(id) ?? keyword.find((k) => resultRefId(k) === id)!;
       return { ...hit, similarity: score };
+    });
+    const results = this.postProcessHits(fusedHits, limit, {
+      ...opts,
+      granularity,
+      expandSimilarityOverride: cosineById,
     });
     return { results, mode, warnings };
   }
@@ -519,7 +569,171 @@ export class SearchEngine {
       return null;
     }
   }
+
+  // -----------------------------------------------------------------
+  // Post-processing: dedup-by-section + expand-to-section
+  // -----------------------------------------------------------------
+
+  /**
+   * Apply dedup and/or expand to a ranked hit list. Both features
+   * target block-level hits only; note-level hits are passed through
+   * unchanged. Safe to call with empty/no-op opts — it then only
+   * slices down to `limit`.
+   *
+   * `expandSimilarityOverride` lets the hybrid caller steer expand
+   * decisions with the pre-RRF cosine scale instead of the RRF score
+   * that lives in `hit.similarity` after fusion.
+   */
+  private postProcessHits(
+    hits: SimilarNote[],
+    limit: number,
+    opts: HitPostProcessOptions & {
+      granularity?: Granularity;
+      expandSimilarityOverride?: Map<string, number>;
+    },
+  ): SimilarNote[] {
+    const granularity = opts.granularity ?? 'block';
+    const dedupEnabled = (opts.deduplicate_by_section ?? DEFAULT_DEDUP_ENABLED) && granularity === 'block';
+    const expandMode: ExpandMode = opts.expand_to_section ?? DEFAULT_EXPAND_MODE;
+    const expandEnabled = expandMode !== 'never' && granularity === 'block';
+
+    let out = hits;
+    if (dedupEnabled) {
+      const level = opts.dedup_level ?? DEFAULT_DEDUP_LEVEL;
+      out = dedupBySection(out, level);
+    }
+    if (out.length > limit) out = out.slice(0, limit);
+
+    if (expandEnabled) {
+      out = this.applyExpand(out, {
+        mode: expandMode,
+        threshold: opts.expand_threshold ?? DEFAULT_EXPAND_THRESHOLD,
+        max_chars: opts.expand_max_chars ?? DEFAULT_EXPAND_MAX_CHARS,
+        similarityOverride: opts.expandSimilarityOverride,
+      });
+    }
+    return out;
+  }
+
+  private applyExpand(
+    hits: SimilarNote[],
+    opts: {
+      mode: ExpandMode;
+      threshold: number;
+      max_chars: number;
+      similarityOverride?: Map<string, number>;
+    },
+  ): SimilarNote[] {
+    return hits.map((hit) => {
+      if (!hit.heading) return hit;
+
+      const sourceKey = `${hit.path}${hit.heading}`;
+      const decisionSim = opts.similarityOverride?.get(sourceKey) ?? hit.similarity;
+      const isFragment = /#\{\d+\}$/.test(hit.heading);
+      const isHighSim = decisionSim >= opts.threshold;
+      const isTopLevel = /^##[^#]+$/.test(hit.heading);
+
+      let reason: HitExpansionReason | null = null;
+      if (opts.mode === 'always') {
+        reason = 'forced';
+      } else {
+        // 'high-similarity'
+        if (isFragment) reason = 'fragment auto-expand';
+        else if (isHighSim && !isTopLevel) reason = 'similarity >= threshold';
+        else if (isHighSim && isTopLevel) reason = 'high-sim ##-section inline';
+      }
+      if (!reason) return hit;
+
+      const targetBlock: SmartBlock | null =
+        isTopLevel && !isFragment
+          ? this.loader.getBlock(sourceKey) ?? null
+          : this.findParentBlock(sourceKey);
+
+      if (!targetBlock) {
+        return {
+          ...hit,
+          expansion: {
+            applied: false,
+            reason: 'parent block not in index',
+            original_heading: hit.heading,
+            truncated_to_max_chars: false,
+          },
+        };
+      }
+
+      let content: string;
+      try {
+        content = this.loader.extractBlockContent(targetBlock.source_path, targetBlock.heading);
+      } catch {
+        return {
+          ...hit,
+          expansion: {
+            applied: false,
+            reason: 'block content unavailable',
+            original_heading: hit.heading,
+            truncated_to_max_chars: false,
+          },
+        };
+      }
+
+      if (!content) {
+        return {
+          ...hit,
+          expansion: {
+            applied: false,
+            reason: 'block content unavailable',
+            original_heading: hit.heading,
+            truncated_to_max_chars: false,
+          },
+        };
+      }
+
+      const truncated = content.length > opts.max_chars;
+      const section_content = truncated ? content.slice(0, opts.max_chars) : content;
+
+      return {
+        ...hit,
+        section_content,
+        section_heading: targetBlock.heading,
+        section_lines: targetBlock.lines[0] > 0 ? targetBlock.lines : undefined,
+        expansion: {
+          applied: true,
+          reason,
+          original_heading: hit.heading,
+          truncated_to_max_chars: truncated,
+        },
+      };
+    });
+  }
+
+  /**
+   * Walk up the heading chain of a block key until we find an ancestor
+   * that exists in the block index. Returns `null` if the walk reaches
+   * the note level (no `#` left) without hitting a known block — in
+   * that case the caller should leave the hit unchanged instead of
+   * promoting it to note-level content.
+   */
+  private findParentBlock(childKey: string): SmartBlock | null {
+    let key = childKey;
+    while (true) {
+      const lastHash = key.lastIndexOf('#');
+      if (lastHash === -1) return null;
+      key = key.slice(0, lastHash);
+      // strip trailing '#' residues left by "##" markers — each pass
+      // removes one # and also aborts if that takes us below note level.
+      while (key.endsWith('#')) {
+        const stripped = key.slice(0, -1);
+        if (!stripped.includes('#')) return null;
+        key = stripped;
+      }
+      if (!key.includes('#')) return null;
+      const candidate = this.loader.getBlock(key);
+      if (candidate) return candidate;
+    }
+  }
 }
+
+type HitExpansionReason = HitExpansion['reason'];
 
 function truncate(text: string, maxChars: number): { text: string; truncated: boolean } {
   if (text.length <= maxChars) return { text, truncated: false };
@@ -564,6 +778,86 @@ function rrfFuse(
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
     .map(([id, score]) => ({ id, score }));
+}
+
+/**
+ * Larger fetch window when dedup or expand is enabled: dedup can
+ * collapse many hits into one, so without overfetch we would starve
+ * the final limit. Capped at 100 to match MAX_LIMIT upstream.
+ */
+function overFetchLimit(
+  limit: number,
+  granularity: Granularity,
+  opts: HitPostProcessOptions,
+): number {
+  if (granularity !== 'block') return limit;
+  const dedupOn = opts.deduplicate_by_section ?? DEFAULT_DEDUP_ENABLED;
+  const expandMode = opts.expand_to_section ?? DEFAULT_EXPAND_MODE;
+  if (!dedupOn && expandMode === 'never') return limit;
+  return Math.min(limit * DEDUP_FETCH_MULTIPLIER, 100);
+}
+
+/**
+ * Group block-level hits by their `##` (level=2) or `###` (level=3)
+ * ancestor and keep the best-similarity hit per group. The dropped
+ * siblings are attached to the kept hit as `sibling_matches`.
+ *
+ * Note-level hits and block-level hits whose heading does not start
+ * with `##` are passed through unchanged (their group key degrades
+ * to path+heading, so they self-dedupe without side effects).
+ */
+function dedupBySection(hits: SimilarNote[], level: 2 | 3): SimilarNote[] {
+  if (hits.length === 0) return hits;
+  const groups = new Map<string, SimilarNote[]>();
+  const order: string[] = [];
+  for (const hit of hits) {
+    const k = sectionKeyFor(hit, level);
+    if (!groups.has(k)) {
+      groups.set(k, []);
+      order.push(k);
+    }
+    groups.get(k)!.push(hit);
+  }
+  const kept: SimilarNote[] = [];
+  for (const k of order) {
+    const group = groups.get(k)!;
+    // group preserves original ranked order — best similarity comes first.
+    const [best, ...siblings] = group;
+    if (siblings.length > 0) {
+      kept.push({
+        ...best,
+        sibling_matches: siblings.map((s) => ({
+          heading: s.heading ?? '',
+          similarity: s.similarity,
+          lines: s.lines,
+        })),
+      });
+    } else {
+      kept.push(best);
+    }
+  }
+  return kept;
+}
+
+/**
+ * Section key used by `dedupBySection`. Splits the heading chain into
+ * segments (the `#`-runs between them become part of the delimiter) and
+ * groups by the first `level` segments. Smart Connections frequently
+ * encodes the note's H1 title as the first segment, so `level=2` means
+ * "same top-level subsection under the same document" — which is the
+ * coverage-improving grouping we want by default.
+ *
+ * Fragment-only hits (`#{N}` with nothing before) and note-level hits
+ * degrade to a per-hit key so they don't collapse into unrelated
+ * groups.
+ */
+function sectionKeyFor(hit: SimilarNote, level: 2 | 3): string {
+  if (!hit.heading) return hit.path;
+  const segments = hit.heading.split(/#+/).filter((s) => s.length > 0);
+  if (segments.length === 0) return `${hit.path}${hit.heading}`;
+  const take = Math.min(level, segments.length);
+  const parts = segments.slice(0, take);
+  return `${hit.path}|${parts.join('|')}`;
 }
 
 // Unused imports kept-away from eslint-nopunctuation by referencing types.

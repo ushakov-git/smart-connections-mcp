@@ -123,6 +123,41 @@ export interface SimilarNote extends ResultRef {
   /** True if the excerpt was truncated. */
   excerpt_truncated?: boolean;
   matchedContent?: string;
+
+  /**
+   * Full markdown of a parent section when the hit was auto-expanded
+   * (see `expansion`). The excerpt is left in place for back-compat.
+   */
+  section_content?: string;
+  /** Heading of the expanded parent block. */
+  section_heading?: string;
+  /** Line range [start, end] of the expanded parent block. */
+  section_lines?: [number, number];
+  /** Diagnostic block describing why/how the hit was expanded. */
+  expansion?: HitExpansion;
+  /**
+   * Sibling hits collapsed into this one during dedup-by-section.
+   * Each entry is a matched block that shares the same parent `##`
+   * (or `###`) section with the retained hit.
+   */
+  sibling_matches?: Array<{
+    heading: string;
+    similarity: number;
+    lines?: [number, number];
+  }>;
+}
+
+export interface HitExpansion {
+  applied: boolean;
+  reason:
+    | 'fragment auto-expand'
+    | 'similarity >= threshold'
+    | 'high-sim ##-section inline'
+    | 'forced'
+    | 'parent block not in index'
+    | 'block content unavailable';
+  original_heading: string;
+  truncated_to_max_chars: boolean;
 }
 
 export interface ConnectionNode {

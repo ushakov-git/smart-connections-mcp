@@ -133,6 +133,20 @@ const MAX_LIMIT = 100;
 // ---------------------------------------------------------------- schemas
 
 const Granularity = z.enum(['note', 'block']);
+const ExpandMode = z.enum(['never', 'high-similarity', 'always']);
+const DedupLevel = z.union([z.literal(2), z.literal(3)]);
+const EXPAND_MAX_CHARS_CAP = 20_000;
+const DEFAULT_EXPAND_THRESHOLD = 0.8;
+const DEFAULT_EXPAND_MAX_CHARS = 5_000;
+
+// Post-processing knobs shared by every search tool that returns ranked hits.
+const PostProcessShape = {
+  expand_to_section: ExpandMode.default('high-similarity'),
+  expand_threshold: z.number().min(0).max(1).default(DEFAULT_EXPAND_THRESHOLD),
+  expand_max_chars: z.number().int().positive().max(EXPAND_MAX_CHARS_CAP).default(DEFAULT_EXPAND_MAX_CHARS),
+  deduplicate_by_section: z.boolean().default(true),
+  dedup_level: DedupLevel.default(2),
+} as const;
 
 const GetSimilarNotesSchema = z.object({
   note_path: z.string().min(1).max(1024),
@@ -141,6 +155,7 @@ const GetSimilarNotesSchema = z.object({
   granularity: Granularity.default('block'),
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
+  ...PostProcessShape,
 });
 
 const SearchBlocksSchema = z.object({
@@ -149,6 +164,7 @@ const SearchBlocksSchema = z.object({
   limit: z.number().int().positive().max(MAX_LIMIT).default(10),
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
+  ...PostProcessShape,
 });
 
 const GetConnectionGraphSchema = z.object({
@@ -166,6 +182,7 @@ const SearchNotesSchema = z.object({
   granularity: z.enum(['note', 'block']).default('block'),
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
+  ...PostProcessShape,
 });
 
 const GetEmbeddingNeighborsSchema = z.object({
@@ -175,6 +192,7 @@ const GetEmbeddingNeighborsSchema = z.object({
   granularity: Granularity.default('block'),
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
+  ...PostProcessShape,
 });
 
 const GetNoteContentSchema = z.object({
@@ -203,11 +221,53 @@ const GetStatsSchema = z.object({});
 
 const dimsHint = `${activeModel.dims}-dimensional (active model: ${activeModel.model_key})`;
 
+// JSON-schema fragment for the post-processing knobs, mirrored in every
+// tool that returns ranked block-level hits. Kept in one place so the
+// four tool schemas stay in sync with the Zod-side `PostProcessShape`.
+const postProcessJsonSchema = {
+  expand_to_section: {
+    type: 'string',
+    enum: ['never', 'high-similarity', 'always'],
+    default: 'high-similarity',
+    description:
+      'How to enrich block-level hits with parent-section content. "high-similarity" (default) expands a hit when cosine similarity ≥ expand_threshold OR when the heading ends with a "#{N}" fragment suffix. "always" expands every block hit. "never" keeps only the excerpt. Expansion adds `section_content`, `section_heading`, `section_lines`, and a diagnostic `expansion` object to each hit.',
+  },
+  expand_threshold: {
+    type: 'number',
+    minimum: 0,
+    maximum: 1,
+    default: DEFAULT_EXPAND_THRESHOLD,
+    description:
+      'Minimum cosine similarity that triggers expansion in "high-similarity" mode. Always applied on the cosine scale — in hybrid mode this is the pre-fusion cosine, not the RRF score.',
+  },
+  expand_max_chars: {
+    type: 'number',
+    minimum: 1,
+    maximum: EXPAND_MAX_CHARS_CAP,
+    default: DEFAULT_EXPAND_MAX_CHARS,
+    description:
+      'Cap on `section_content` size. Longer sections are truncated; the hit\'s `expansion.truncated_to_max_chars` flag reports when that happens.',
+  },
+  deduplicate_by_section: {
+    type: 'boolean',
+    default: true,
+    description:
+      'Group block-level hits that share the same parent section (level configured by dedup_level). The best-similarity hit is kept; dropped siblings are attached as `sibling_matches`. Useful for wider vault coverage: without dedup, top-5 is often 4 slots of the same section.',
+  },
+  dedup_level: {
+    type: 'number',
+    enum: [2, 3],
+    default: 2,
+    description:
+      'Heading level used as the dedup key. 2 groups by "##" (default — widest coverage); 3 groups by "###" (finer; dedups only inside the same subsection).',
+  },
+} as const;
+
 const tools: Tool[] = [
   {
     name: 'get_similar_notes',
     description:
-      'Find semantically similar items to a given note using embeddings. Results are block-level by default (each hit carries `path`, `heading`, `lines`, optional `excerpt`), so the agent can either use the excerpt or follow the reference via `get_block_content`. Switch `granularity` to "note" for document-level matches.',
+      'Find semantically similar items to a given note using embeddings. Results are block-level by default (each hit carries `path`, `heading`, `lines`, optional `excerpt`). When a hit is high-similarity or its heading ends with a "#{N}" fragment suffix, the server auto-expands it and adds `section_content` (full parent-section markdown) — prefer that over re-calling `get_block_content`. Switch `granularity` to "note" for document-level matches (expansion disabled in that mode).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -217,6 +277,7 @@ const tools: Tool[] = [
         granularity: { type: 'string', enum: ['note', 'block'], default: 'block' },
         include_excerpt: { type: 'boolean', default: true },
         excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
+        ...postProcessJsonSchema,
       },
       required: ['note_path'],
     },
@@ -224,7 +285,7 @@ const tools: Tool[] = [
   {
     name: 'search_blocks',
     description:
-      'Find blocks (heading-scoped sections) similar to an existing block identified by its compound key "path#heading-chain". Returns hits enriched with `path`, `heading`, `lines`, and an `excerpt` for immediate use; follow up with `get_block_content` to fetch the full block text.',
+      'Find blocks (heading-scoped sections) similar to an existing block identified by its compound key "path#heading-chain". Returns hits enriched with `path`, `heading`, `lines`, and an `excerpt`. By default high-similarity hits and fragment-suffix hits ("#{N}") are auto-expanded with `section_content` (full parent-section markdown) — use that before calling `get_block_content` separately.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -236,6 +297,7 @@ const tools: Tool[] = [
         limit: { type: 'number', minimum: 1, maximum: MAX_LIMIT, default: 10 },
         include_excerpt: { type: 'boolean', default: true },
         excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
+        ...postProcessJsonSchema,
       },
       required: ['block_key'],
     },
@@ -276,13 +338,14 @@ const tools: Tool[] = [
         },
         include_excerpt: { type: 'boolean', default: true },
         excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
+        ...postProcessJsonSchema,
       },
       required: ['query'],
     },
   },
   {
     name: 'get_embedding_neighbors',
-    description: `Find nearest neighbors for a raw embedding vector. The vector must be ${dimsHint}. Granularity selects note- or block-level hits.`,
+    description: `Find nearest neighbors for a raw embedding vector. The vector must be ${dimsHint}. Granularity selects note- or block-level hits. Auto-expansion and dedup apply to block-level results (see expand_to_section and deduplicate_by_section).`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -296,6 +359,7 @@ const tools: Tool[] = [
         granularity: { type: 'string', enum: ['note', 'block'], default: 'block' },
         include_excerpt: { type: 'boolean', default: true },
         excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
+        ...postProcessJsonSchema,
       },
       required: ['embedding_vector'],
     },
@@ -386,8 +450,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           granularity: p.granularity,
           include_excerpt: p.include_excerpt,
           excerpt_chars: p.excerpt_chars,
+          expand_to_section: p.expand_to_section,
+          expand_threshold: p.expand_threshold,
+          expand_max_chars: p.expand_max_chars,
+          deduplicate_by_section: p.deduplicate_by_section,
+          dedup_level: p.dedup_level,
         });
-        return ok({ meta: baseMeta(), results });
+        return ok({ meta: baseMetaWithPostProcess(results, p), results });
       }
 
       case 'search_blocks': {
@@ -395,8 +464,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const results = searchEngine.getSimilarBlocks(p.block_key, p.threshold, p.limit, {
           include_excerpt: p.include_excerpt,
           excerpt_chars: p.excerpt_chars,
+          expand_to_section: p.expand_to_section,
+          expand_threshold: p.expand_threshold,
+          expand_max_chars: p.expand_max_chars,
+          deduplicate_by_section: p.deduplicate_by_section,
+          dedup_level: p.dedup_level,
         });
-        return ok({ meta: baseMeta(), results });
+        return ok({ meta: baseMetaWithPostProcess(results, p), results });
       }
 
       case 'get_connection_graph': {
@@ -414,10 +488,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           granularity: p.granularity,
           include_excerpt: p.include_excerpt,
           excerpt_chars: p.excerpt_chars,
+          expand_to_section: p.expand_to_section,
+          expand_threshold: p.expand_threshold,
+          expand_max_chars: p.expand_max_chars,
+          deduplicate_by_section: p.deduplicate_by_section,
+          dedup_level: p.dedup_level,
         });
         return ok({
           meta: {
-            ...baseMeta(),
+            ...baseMetaWithPostProcess(out.results, p),
             search_mode: out.mode,
             fallback_from: out.fallback_from,
             warnings: out.warnings,
@@ -432,8 +511,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           granularity: p.granularity,
           include_excerpt: p.include_excerpt,
           excerpt_chars: p.excerpt_chars,
+          expand_to_section: p.expand_to_section,
+          expand_threshold: p.expand_threshold,
+          expand_max_chars: p.expand_max_chars,
+          deduplicate_by_section: p.deduplicate_by_section,
+          dedup_level: p.dedup_level,
         });
-        return ok({ meta: baseMeta(), results });
+        return ok({ meta: baseMetaWithPostProcess(results, p), results });
       }
 
       case 'get_note_content': {
@@ -489,6 +573,74 @@ function baseMeta() {
     total_blocks: loader.getBlocks().size,
     fusion: searchEngine.getFusionConfig(),
   };
+}
+
+/**
+ * Extend the base meta with per-response diagnostics for the post-processing
+ * step. `expansion` reports how many block-level hits were actually enriched
+ * with `section_content`; `dedup` reports how many sibling hits were folded.
+ * Keeps the `meta` honest about what the returned `results` actually contain,
+ * which is useful for an agent that needs to decide when to follow a
+ * reference with `get_block_content`.
+ */
+function baseMetaWithPostProcess(
+  results: Array<{ expansion?: { applied: boolean }; sibling_matches?: unknown[] }>,
+  params: {
+    expand_to_section?: 'never' | 'high-similarity' | 'always';
+    expand_threshold?: number;
+    expand_max_chars?: number;
+    deduplicate_by_section?: boolean;
+    dedup_level?: 2 | 3;
+    granularity?: 'note' | 'block';
+  },
+): ReturnType<typeof baseMeta> & {
+  expansion?: {
+    mode: 'never' | 'high-similarity' | 'always';
+    threshold: number;
+    max_chars: number;
+    applied_count: number;
+    skipped_count: number;
+  };
+  dedup?: {
+    enabled: boolean;
+    level: 2 | 3;
+    groups_collapsed: number;
+  };
+} {
+  const base = baseMeta();
+  const granularity = params.granularity ?? 'block';
+  const meta: ReturnType<typeof baseMetaWithPostProcess> = base;
+  if (granularity !== 'block') return meta;
+
+  const expandMode = params.expand_to_section ?? 'high-similarity';
+  if (expandMode !== 'never') {
+    let applied = 0;
+    let skipped = 0;
+    for (const r of results) {
+      if (r.expansion?.applied) applied++;
+      else if (r.expansion) skipped++;
+    }
+    meta.expansion = {
+      mode: expandMode,
+      threshold: params.expand_threshold ?? DEFAULT_EXPAND_THRESHOLD,
+      max_chars: params.expand_max_chars ?? DEFAULT_EXPAND_MAX_CHARS,
+      applied_count: applied,
+      skipped_count: skipped,
+    };
+  }
+
+  const dedupEnabled = params.deduplicate_by_section ?? true;
+  if (dedupEnabled) {
+    let collapsed = 0;
+    for (const r of results) collapsed += r.sibling_matches?.length ?? 0;
+    meta.dedup = {
+      enabled: true,
+      level: params.dedup_level ?? 2,
+      groups_collapsed: collapsed,
+    };
+  }
+
+  return meta;
 }
 
 // ---------------------------------------------------------------- watcher
