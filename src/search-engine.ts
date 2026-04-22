@@ -491,7 +491,7 @@ export class SearchEngine {
       }
     }
     if (!range || range[0] <= 0) {
-      throw new Error(`Block line range unknown for ${path}${heading}`);
+      throw new Error(`Block not found: ${path}${heading}`);
     }
     const full = this.loader.readNoteContent(path);
     const content = full.split('\n').slice(range[0] - 1, range[1]).join('\n');

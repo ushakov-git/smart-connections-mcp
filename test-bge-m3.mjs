@@ -415,7 +415,7 @@ if (anyBlockKey) {
       // vaults sometimes contain headings that differ only by case), that's
       // also acceptable behavior — record as pass with note.
       ok('fuzzy: get_block_content handles case/whitespace drift',
-         /ambiguous/i.test(String(e)) || /Block line range unknown/.test(String(e)),
+         /ambiguous/i.test(String(e)) || /Block not found/.test(String(e)),
          `error="${String(e).slice(0, 80)}"`);
     }
   }
