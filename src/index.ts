@@ -123,8 +123,9 @@ console.error(
 
 // ---------------------------------------------------------------- limits
 
-const MAX_NOTE_CONTENT_CHARS = 100_000;
+const MAX_NOTE_CONTENT_CHARS = 200_000;
 const MAX_EXCERPT_CHARS_CAP = 5_000;
+const DEFAULT_EXCERPT_CHARS = 1_500;
 const MAX_DEPTH = 4;
 const MAX_PER_LEVEL = 25;
 const MAX_LIMIT = 100;
@@ -139,7 +140,7 @@ const GetSimilarNotesSchema = z.object({
   limit: z.number().int().positive().max(MAX_LIMIT).default(10),
   granularity: Granularity.default('block'),
   include_excerpt: z.boolean().default(true),
-  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(500),
+  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
 });
 
 const SearchBlocksSchema = z.object({
@@ -147,7 +148,7 @@ const SearchBlocksSchema = z.object({
   threshold: z.number().min(0).max(1).default(0.5),
   limit: z.number().int().positive().max(MAX_LIMIT).default(10),
   include_excerpt: z.boolean().default(true),
-  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(500),
+  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
 });
 
 const GetConnectionGraphSchema = z.object({
@@ -164,7 +165,7 @@ const SearchNotesSchema = z.object({
   mode: z.enum(['semantic', 'keyword', 'hybrid']).optional(),
   granularity: z.enum(['note', 'block']).default('block'),
   include_excerpt: z.boolean().default(true),
-  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(500),
+  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
 });
 
 const GetEmbeddingNeighborsSchema = z.object({
@@ -173,7 +174,7 @@ const GetEmbeddingNeighborsSchema = z.object({
   threshold: z.number().min(0).max(1).default(0.5),
   granularity: Granularity.default('block'),
   include_excerpt: z.boolean().default(true),
-  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(500),
+  excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
 });
 
 const GetNoteContentSchema = z.object({
@@ -215,7 +216,7 @@ const tools: Tool[] = [
         limit: { type: 'number', minimum: 1, maximum: MAX_LIMIT, default: 10 },
         granularity: { type: 'string', enum: ['note', 'block'], default: 'block' },
         include_excerpt: { type: 'boolean', default: true },
-        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: 500 },
+        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
       },
       required: ['note_path'],
     },
@@ -234,7 +235,7 @@ const tools: Tool[] = [
         threshold: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
         limit: { type: 'number', minimum: 1, maximum: MAX_LIMIT, default: 10 },
         include_excerpt: { type: 'boolean', default: true },
-        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: 500 },
+        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
       },
       required: ['block_key'],
     },
@@ -257,7 +258,7 @@ const tools: Tool[] = [
   {
     name: 'search_notes',
     description:
-      'Search by a free-form query. Modes: "semantic" (embed via Ollama, cosine at block granularity by default), "keyword" (substring scoring over note bodies), "hybrid" (RRF fusion of both, k=60). Default is hybrid when Ollama is available, otherwise keyword. Hits carry the same reference packet as `get_similar_notes` (path, heading, lines, excerpt).',
+      'Search by a free-form query. Modes: "semantic" (embed via Ollama, cosine at block granularity by default), "keyword" (substring scoring over note bodies), "hybrid" (RRF fusion of both, k=60). Default is hybrid when Ollama is available, otherwise keyword. Hits carry the same reference packet as `get_similar_notes` (path, heading, lines, excerpt).\n\nIMPORTANT: in "hybrid" mode the `similarity` field contains a raw RRF score (typically ~0.01), NOT a cosine. Items are ordered by rank, not by an absolute 0..1 scale — do not compare hybrid similarity to cosine. For cosine-ranked results use `mode: "semantic"` or call `get_similar_notes` on the top hit. The `threshold` parameter is applied to the semantic component pre-fusion; it does not filter the final hybrid ranking.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -265,9 +266,16 @@ const tools: Tool[] = [
         mode: { type: 'string', enum: ['semantic', 'keyword', 'hybrid'], description: 'Default: hybrid if semantic is available, else keyword.' },
         granularity: { type: 'string', enum: ['note', 'block'], default: 'block' },
         limit: { type: 'number', minimum: 1, maximum: MAX_LIMIT, default: 10 },
-        threshold: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
+        threshold: {
+          type: 'number',
+          minimum: 0,
+          maximum: 1,
+          default: 0.5,
+          description:
+            'Minimum cosine similarity. Applied directly in "semantic" mode, applied to the semantic component pre-RRF in "hybrid" mode, and ignored in "keyword" mode. It does NOT filter the final RRF score in hybrid.',
+        },
         include_excerpt: { type: 'boolean', default: true },
-        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: 500 },
+        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
       },
       required: ['query'],
     },
@@ -287,7 +295,7 @@ const tools: Tool[] = [
         threshold: { type: 'number', minimum: 0, maximum: 1, default: 0.5 },
         granularity: { type: 'string', enum: ['note', 'block'], default: 'block' },
         include_excerpt: { type: 'boolean', default: true },
-        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: 500 },
+        excerpt_chars: { type: 'number', minimum: 1, maximum: MAX_EXCERPT_CHARS_CAP, default: DEFAULT_EXCERPT_CHARS },
       },
       required: ['embedding_vector'],
     },
@@ -295,7 +303,7 @@ const tools: Tool[] = [
   {
     name: 'get_note_content',
     description:
-      `Retrieve a note's markdown. By default the response is capped at ${MAX_NOTE_CONTENT_CHARS} characters; set \`full: true\` to disable the cap.`,
+      `Retrieve a note's markdown. By default the response is capped at ${MAX_NOTE_CONTENT_CHARS} characters and the meta reports \`truncated: true\` when that happens; always check that flag. For long notes (content-heavy reference material, curriculum, long-form research) pass \`full: true\` to disable the cap and receive the complete text — there is no security risk beyond what the path-containment guard already blocks.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -305,7 +313,11 @@ const tools: Tool[] = [
           items: { type: 'string' },
           description: 'Optional list of heading chains to extract as named blocks.',
         },
-        full: { type: 'boolean', default: false },
+        full: {
+          type: 'boolean',
+          default: false,
+          description: `Disable the ${MAX_NOTE_CONTENT_CHARS}-character cap. Use when the note is known or expected to be long.`,
+        },
       },
       required: ['note_path'],
     },

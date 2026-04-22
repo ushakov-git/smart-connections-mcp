@@ -36,7 +36,7 @@ export interface SearchOptions {
   excerpt_chars?: number;
 }
 
-const DEFAULT_EXCERPT_CHARS = 500;
+const DEFAULT_EXCERPT_CHARS = 1_500;
 
 /**
  * Tunable parameters of the hybrid Reciprocal Rank Fusion step.
