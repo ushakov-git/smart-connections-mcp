@@ -7,12 +7,37 @@ MCP-клиентов (Claude Desktop, Claude Code, произвольные аг
 (`<vault>/.smart-env/`) и отдаёт наружу семантический поиск, навигацию
 по разделам и содержимое файлов.
 
-Эта документация описывает v2.2.0 — форк, переписанный под современный
+Эта документация описывает v2.2.1 — форк, переписанный под современный
 формат плагина, модели Ollama (в частности `bge-m3`), блочную
-гранулярность поиска, горячую перезагрузку, а также расширение
-результатов целыми разделами (`expand_to_section`) и
-дедупликацию (`deduplicate_by_section`). Для краткой английской
+гранулярность поиска, горячую перезагрузку, расширение
+результатов целыми разделами (`expand_to_section`),
+дедупликацию (`deduplicate_by_section`) и управляемый размер ответа
+(`include_blocks_list` / `max_blocks_per_hit`). Для краткой английской
 версии смотри [README.md](README.md).
+
+## Что нового в v2.2.1 (кратко)
+
+1. **`include_blocks_list` / `max_blocks_per_hit`** — для
+   `get_similar_notes`, `search_notes`, `get_embedding_neighbors`
+   по умолчанию `false`: note-granularity хиты больше не тянут
+   полный `blocks[]` с сотнями heading-ключей, что приводило к
+   ответам, не влезающим в токен-лимит клиента. В
+   `get_note_content` дефолт `true` (для совместимости) +
+   `max_blocks` (150) — огромные заметки не раздувают JSON.
+   Флаги `blocks_truncated` + `total_blocks_in_note` сообщают
+   о трансформации.
+2. **`get_block_content` на несуществующем heading** теперь
+   бросает `"Block not found: <key>"` — как обещал README и
+   CHANGES. Раньше сервер кидал "Block line range unknown..."
+   вразрез с документацией.
+3. **Smoke-тесты 73 → 86** — добавлены: унифицированный error,
+   `include_blocks_list` default-off и opt-in, `max_blocks`
+   truncation, `expand_to_section: "always"`, `DISABLE_SEMANTIC_SEARCH`
+   fallback, три класса path-traversal guard.
+
+**Breaking default:** если потребитель полагался на `blocks[]` в
+note-granularity search-результатах — теперь нужно явно
+`include_blocks_list: true`.
 
 ## Что нового в v2.2.0 (кратко)
 

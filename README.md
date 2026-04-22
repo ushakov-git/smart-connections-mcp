@@ -129,6 +129,8 @@ Every hit carries a *reference packet* so the agent can decide whether the embed
 | `expand_max_chars` | `5000` | Cap on `section_content` size; truncation is reported via `expansion.truncated_to_max_chars`. |
 | `deduplicate_by_section` | `true` | Group hits that share the first N heading segments and keep only the best-similarity one; the rest move into `sibling_matches`. |
 | `dedup_level` | `2` | Number of leading heading segments that define a "section" for dedup. `2` matches `##` granularity (default — widest coverage), `3` matches `###`. |
+| `include_blocks_list` (v2.2.1) | `false` (search), `true` (`get_note_content`) | Attach the full heading-key list (`blocks[]`) to note-granularity hits / note-content responses. Default-off on search hits because a single large note can carry hundreds of keys that blow past the MCP client token limit. Enable explicitly when you need to enumerate subsections. |
+| `max_blocks_per_hit` (v2.2.1) | `30` | Upper bound on `blocks[]` length per note-granularity hit when the list is opted in. Extra keys are dropped and `blocks_truncated: true` + `total_blocks_in_note` are set. `get_note_content` uses `max_blocks` (default `150`) instead. |
 
 The `meta` reports what the post-processor did: `meta.expansion = { mode, threshold, max_chars, applied_count, skipped_count }` and `meta.dedup = { enabled, level, groups_collapsed }`.
 

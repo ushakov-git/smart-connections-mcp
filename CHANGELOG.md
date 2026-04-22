@@ -1,6 +1,62 @@
 
 # Changelog
 
+## v2.2.1 — 2026-04-23
+
+Patch release driven by live testing on a real vault
+(`test-reports/TESTING_REPORT_v2.2.0.md`). All three findings from
+that report are resolved; functionality is additive except for one
+default-value change, noted below.
+
+### Response-size controls (breaking default)
+
+Large vaults were producing `get_similar_notes(granularity: "note")`
+and `get_note_content` responses that exceeded the MCP client token
+limit. Each note-level hit carried a full `blocks[]` list of heading
+keys, which on notes with 100+ headings dominated the payload.
+
+- **`get_similar_notes`, `search_notes`, `get_embedding_neighbors`**
+  gain `include_blocks_list` (default **`false`**) and
+  `max_blocks_per_hit` (default `30`, cap `500`). **Breaking
+  default:** note-granularity hits no longer ship with `blocks[]`
+  unless opted in. Pass `include_blocks_list: true` to restore the
+  old shape; when the list is included it is capped, with
+  `blocks_truncated: true` + `total_blocks_in_note` set.
+- **`get_note_content`** gains `include_blocks_list` (default
+  `true` — back-compat) and `max_blocks` (default `150`, cap
+  `2000`). Huge notes no longer stuff hundreds of heading keys
+  into the JSON reply; the trim is flagged via `blocks_truncated`
+  and the full count via `total_blocks_in_note`.
+- `search_blocks` is unchanged — it is block-only and never carried
+  the list.
+
+### Error-message parity
+
+- **`get_block_content`** now throws `"Block not found: <key>"` on
+  an unknown heading, matching the wording documented in the
+  README and CHANGES. Previously the server threw "Block line
+  range unknown for ..." while docs promised the other form —
+  resolved.
+
+### Tests
+
+- Smoke suite 73 → 86 checks. New coverage: unified "Block not
+  found" message, `include_blocks_list` default-off and opt-in
+  behaviour, `max_blocks` truncation in `get_note_content`,
+  `expand_to_section: "always"`, `DISABLE_SEMANTIC_SEARCH`
+  fallback path (via engine built without Ollama), and all three
+  path-traversal classes through `readNoteContent`.
+
+### Migration
+
+Callers that relied on `blocks[]` in note-granularity search
+results must now pass `include_blocks_list: true` explicitly. In
+practice this surface was rarely used — the field duplicated the
+same heading list on every hit, and agents already had `path` to
+call `get_note_content` when a list was actually wanted.
+
+---
+
 ## v2.2.0 — 2026-04-22
 
 Incremental. No breaking changes to existing fields; additive only.
