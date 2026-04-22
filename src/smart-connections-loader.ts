@@ -32,6 +32,17 @@ function assertAllowedExtension(notePath: string): void {
   }
 }
 
+/**
+ * Normalize a heading chain for fuzzy comparison. Keeps `#`-structure
+ * (so we still match on heading levels) but lowercases and collapses
+ * all other whitespace runs into single spaces. This absorbs trailing
+ * spaces, CRLF artefacts, and case drift — the common failure modes
+ * we saw between tools that exchange heading keys.
+ */
+function normalizeHeading(heading: string): string {
+  return heading.toLowerCase().replace(/[ \t\r]+/g, ' ').trim();
+}
+
 export interface LoadStats {
   sourceFilesScanned: number;
   sourcesKept: number;
@@ -372,6 +383,72 @@ export class SmartConnectionsLoader {
 
   getBlock(blockKey: string): SmartBlock | undefined {
     return this.blocks.get(blockKey);
+  }
+
+  /**
+   * Fuzzy block lookup. Returns the exact match when present; otherwise
+   * searches the block index for a single entry whose (path, normalized
+   * heading) matches. Normalization lowercases and collapses whitespace
+   * — enough to forgive trailing-space pastes and case drift between
+   * tools while still refusing ambiguous matches.
+   *
+   * Returns:
+   *   - `exact`: the block as `getBlock()` would return, `matched = true`;
+   *   - `fuzzy`: exactly one normalized match, with `warning` describing
+   *     the resolution and `canonical_key`;
+   *   - `ambiguous`: more than one normalized match — returns the list
+   *     so the caller can surface a helpful error;
+   *   - `miss`: no match.
+   */
+  findBlockFuzzy(args: { key?: string; path?: string; heading?: string }): {
+    status: 'exact' | 'fuzzy' | 'ambiguous' | 'miss';
+    block?: SmartBlock;
+    canonical_key?: string;
+    warning?: string;
+    candidates?: string[];
+  } {
+    // Build the "requested" key we're trying to resolve.
+    let requestedKey: string;
+    if (args.key) {
+      requestedKey = args.key;
+    } else if (args.path && args.heading) {
+      const heading = args.heading.startsWith('#') ? args.heading : `#${args.heading}`;
+      requestedKey = `${args.path}${heading}`;
+    } else {
+      return { status: 'miss' };
+    }
+
+    const exact = this.blocks.get(requestedKey);
+    if (exact) return { status: 'exact', block: exact, canonical_key: requestedKey };
+
+    // Split into path + heading for normalized comparison.
+    const firstHash = requestedKey.indexOf('#');
+    if (firstHash <= 0) return { status: 'miss' };
+    const reqPath = requestedKey.slice(0, firstHash);
+    const reqHeading = requestedKey.slice(firstHash);
+    const reqNorm = normalizeHeading(reqHeading);
+
+    // Scan blocks under the same path (usually 10-200 entries — cheap).
+    const pathKeys = this.blocksBySource.get(reqPath);
+    const candidates: string[] = [];
+    const source = pathKeys ?? [];
+    for (const k of source) {
+      const h = k.slice(reqPath.length);
+      if (normalizeHeading(h) === reqNorm) candidates.push(k);
+    }
+
+    if (candidates.length === 1) {
+      return {
+        status: 'fuzzy',
+        block: this.blocks.get(candidates[0]),
+        canonical_key: candidates[0],
+        warning: `fuzzy-matched: requested heading "${reqHeading}" resolved to "${candidates[0].slice(reqPath.length)}"`,
+      };
+    }
+    if (candidates.length > 1) {
+      return { status: 'ambiguous', candidates };
+    }
+    return { status: 'miss' };
   }
 
   /** List block keys contained in a given note. Empty array if none indexed. */

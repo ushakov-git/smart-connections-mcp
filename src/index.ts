@@ -389,7 +389,7 @@ const tools: Tool[] = [
   {
     name: 'get_block_content',
     description:
-      'Retrieve the full markdown of a single block identified by its compound key, or by (path, heading) pair. Use this after `get_similar_notes` / `search_blocks` when the excerpt is not enough.',
+      'Retrieve the full markdown of a single block identified by its compound key, or by (path, heading) pair. Use this after `get_similar_notes` / `search_blocks` when the excerpt is not enough. If the exact heading is not found, the server retries with a whitespace/case-insensitive lookup and reports `warnings: ["fuzzy-matched: ..."]` on resolution.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -461,7 +461,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'search_blocks': {
         const p = SearchBlocksSchema.parse(args);
-        const results = searchEngine.getSimilarBlocks(p.block_key, p.threshold, p.limit, {
+        const out = searchEngine.getSimilarBlocks(p.block_key, p.threshold, p.limit, {
           include_excerpt: p.include_excerpt,
           excerpt_chars: p.excerpt_chars,
           expand_to_section: p.expand_to_section,
@@ -470,7 +470,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           deduplicate_by_section: p.deduplicate_by_section,
           dedup_level: p.dedup_level,
         });
-        return ok({ meta: baseMetaWithPostProcess(results, p), results });
+        const warnings = (out as unknown as { warnings?: string[] }).warnings;
+        const meta = baseMetaWithPostProcess(out, p);
+        return ok({
+          meta: warnings?.length ? { ...meta, warnings } : meta,
+          // `results` is spread so the JSON serializer drops the extra
+          // non-index property we attached for warnings.
+          results: [...out],
+        });
       }
 
       case 'get_connection_graph': {

@@ -171,20 +171,31 @@ export class SearchEngine {
     threshold = 0.5,
     limit = 10,
     opts: Omit<SearchOptions, 'threshold' | 'limit' | 'granularity'> = {},
-  ): SimilarNote[] {
-    const block = this.loader.getBlock(blockKey);
+  ): SimilarNote[] & { warnings?: string[] } {
+    const lookup = this.loader.findBlockFuzzy({ key: blockKey });
+    if (lookup.status === 'ambiguous') {
+      throw new Error(
+        `Block key matched ${lookup.candidates?.length ?? 0} candidates after normalization — refine the heading. Candidates: ${(lookup.candidates ?? []).slice(0, 5).join(' | ')}`,
+      );
+    }
+    const block = lookup.block;
     if (!block) throw new Error(`Block not found: ${blockKey}`);
     const queryVec = block.embeddings[this.active.model_key]?.vec;
     if (!queryVec) throw new Error(`No embedding for block under active model: ${blockKey}`);
+    const excludeKey = lookup.canonical_key ?? blockKey;
     const raw = this.rankByVector(queryVec, {
       threshold,
       limit: overFetchLimit(limit, 'block', opts),
       granularity: 'block',
       include_excerpt: opts.include_excerpt ?? true,
       excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
-      excludeBlockKey: blockKey,
+      excludeBlockKey: excludeKey,
     });
-    return this.postProcessHits(raw, limit, { ...opts, granularity: 'block' });
+    const results = this.postProcessHits(raw, limit, { ...opts, granularity: 'block' });
+    if (lookup.status === 'fuzzy' && lookup.warning) {
+      return Object.assign(results, { warnings: [lookup.warning] });
+    }
+    return results;
   }
 
   // -----------------------------------------------------------------
@@ -305,11 +316,21 @@ export class SearchEngine {
       const hit = semById.get(id) ?? keyword.find((k) => resultRefId(k) === id)!;
       return { ...hit, similarity: score };
     });
-    const results = this.postProcessHits(fusedHits, limit, {
+    const postProcessed = this.postProcessHits(fusedHits, limit, {
       ...opts,
       granularity,
       expandSimilarityOverride: cosineById,
     });
+    // Normalize RRF scores to [0, 1] on the final returned set so the
+    // agent has a hybrid-native 0..1 scale to reason over. `similarity`
+    // is left as the raw RRF score for back-compat with existing
+    // callers/smoke assertions.
+    const maxRrf = postProcessed.reduce((m, h) => Math.max(m, h.similarity), 0);
+    const results = postProcessed.map((h) => ({
+      ...h,
+      raw_rrf_score: h.similarity,
+      rank_score: maxRrf > 0 ? h.similarity / maxRrf : 0,
+    }));
     return { results, mode, warnings };
   }
 
@@ -355,7 +376,12 @@ export class SearchEngine {
   /**
    * Extract a single block's markdown content. Accepts either the
    * compound block key (`path#heading`) or a split `{path, heading}`.
-   * Throws if the block's line range is unknown.
+   *
+   * On exact miss we retry through a fuzzy lookup (whitespace/case
+   * normalization) — this absorbs the common failure where one tool
+   * emits a heading with literal spaces or case drift that another
+   * tool then can't find. Fuzzy resolutions come back with a
+   * `warnings` array naming the canonical key that was used.
    */
   getBlockContent(args: { block_key?: string; path?: string; heading?: string }): {
     path: string;
@@ -363,6 +389,7 @@ export class SearchEngine {
     lines: [number, number];
     content: string;
     vault_name?: string;
+    warnings?: string[];
   } {
     let path: string;
     let heading: string;
@@ -378,13 +405,34 @@ export class SearchEngine {
       throw new Error('Supply either block_key or both (path, heading)');
     }
 
-    const range = this.loader.resolveBlockRange(path, heading);
+    let range = this.loader.resolveBlockRange(path, heading);
+    const warnings: string[] = [];
+    if (!range || range[0] <= 0) {
+      const fuzzy = this.loader.findBlockFuzzy({ path, heading });
+      if (fuzzy.status === 'ambiguous') {
+        throw new Error(
+          `Heading "${heading}" is ambiguous for ${path} (matched ${fuzzy.candidates?.length ?? 0} candidates). Use the exact heading.`,
+        );
+      }
+      if (fuzzy.status === 'fuzzy' && fuzzy.block) {
+        range = fuzzy.block.lines;
+        heading = fuzzy.block.heading;
+        if (fuzzy.warning) warnings.push(fuzzy.warning);
+      }
+    }
     if (!range || range[0] <= 0) {
       throw new Error(`Block line range unknown for ${path}${heading}`);
     }
     const full = this.loader.readNoteContent(path);
     const content = full.split('\n').slice(range[0] - 1, range[1]).join('\n');
-    return { path, heading, lines: range, content, vault_name: this.vaultName };
+    return {
+      path,
+      heading,
+      lines: range,
+      content,
+      vault_name: this.vaultName,
+      ...(warnings.length ? { warnings } : {}),
+    };
   }
 
   // -----------------------------------------------------------------

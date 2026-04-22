@@ -145,6 +145,17 @@ export interface SimilarNote extends ResultRef {
     similarity: number;
     lines?: [number, number];
   }>;
+
+  /**
+   * Hybrid-only: final RRF score normalized to [0, 1] by dividing by
+   * the max score in the returned result set (so the top hit is 1.0).
+   * Use this if the agent needs a 0..1 scale for reasoning about
+   * "how confident is this hybrid result"; `similarity` itself still
+   * carries the raw RRF score for back-compat.
+   */
+  rank_score?: number;
+  /** Hybrid-only: the unnormalized RRF score. */
+  raw_rrf_score?: number;
 }
 
 export interface HitExpansion {
