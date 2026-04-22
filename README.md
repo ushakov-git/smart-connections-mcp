@@ -84,19 +84,53 @@ All responses are JSON text with this shape:
 }
 ```
 
-Every hit carries a *reference packet* so the agent can decide whether the embedded excerpt is enough or it needs to fetch more:
+Every hit carries a *reference packet* so the agent can decide whether the embedded excerpt is enough or it needs to fetch more. For high-similarity block hits (and for any `#{N}` fragment) the server also attaches the full parent-section markdown:
 
 ```jsonc
 {
   "path": "01 MASTRA/3. .../Mastra – TypeScript‑фреймворк.md",
-  "heading": "#Observability",
-  "lines": [120, 168],
-  "similarity": 0.742,
-  "excerpt": "...",
+  "heading": "#Observability#{1}",
+  "lines": [120, 125],
+  "similarity": 0.842,
+  "excerpt": "...",                  // up to excerpt_chars (default 1500)
   "excerpt_truncated": false,
-  "vault_name": "Develop"
+  "vault_name": "Develop",
+
+  // v2.2.0: appear when the server expands the hit to its parent section
+  "section_content": "...",          // full markdown, capped by expand_max_chars
+  "section_heading": "#Observability",
+  "section_lines": [115, 200],
+  "expansion": {
+    "applied": true,
+    "reason": "fragment auto-expand",
+    "original_heading": "#Observability#{1}",
+    "truncated_to_max_chars": false
+  },
+
+  // v2.2.0: appear when dedup collapses neighbors from the same section
+  "sibling_matches": [
+    { "heading": "#Observability#Trace export", "similarity": 0.79, "lines": [180, 195] }
+  ],
+
+  // v2.2.0: hybrid mode only
+  "rank_score": 1.0,
+  "raw_rrf_score": 0.0164
 }
 ```
+
+### Post-processing knobs (v2.2.0)
+
+`search_notes`, `get_similar_notes`, `search_blocks`, and `get_embedding_neighbors` accept these extra parameters:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `expand_to_section` | `"high-similarity"` | How aggressively to enrich block hits with full parent-section markdown. `"never"` keeps only the excerpt; `"always"` expands every block hit; `"high-similarity"` expands when the cosine score ≥ `expand_threshold` OR the heading ends with `#{N}`. |
+| `expand_threshold` | `0.8` | Cosine similarity cut-off for the high-similarity mode. In hybrid this is compared against the pre-fusion cosine, not the RRF score. |
+| `expand_max_chars` | `5000` | Cap on `section_content` size; truncation is reported via `expansion.truncated_to_max_chars`. |
+| `deduplicate_by_section` | `true` | Group hits that share the first N heading segments and keep only the best-similarity one; the rest move into `sibling_matches`. |
+| `dedup_level` | `2` | Number of leading heading segments that define a "section" for dedup. `2` matches `##` granularity (default — widest coverage), `3` matches `###`. |
+
+The `meta` reports what the post-processor did: `meta.expansion = { mode, threshold, max_chars, applied_count, skipped_count }` and `meta.dedup = { enabled, level, groups_collapsed }`.
 
 | Tool | What it does |
 |---|---|
@@ -105,8 +139,8 @@ Every hit carries a *reference packet* so the agent can decide whether the embed
 | `search_notes` | Free-form query search. Modes: `semantic` (Ollama), `keyword` (substring), `hybrid` (RRF fusion). Default: hybrid when Ollama is available, else keyword. |
 | `get_embedding_neighbors` | Nearest neighbors for a raw vector. Must match the vault's active dims. |
 | `get_connection_graph` | Nested tree (and flat list) of semantically connected notes from a seed. |
-| `get_note_content` | Full markdown of a note. Default cap 100 000 chars, `full: true` to disable. Extension whitelist: `.md`, `.markdown`, `.canvas`. |
-| `get_block_content` | Markdown of a single heading-scoped block (`block_key` or `{path, heading}`). |
+| `get_note_content` | Full markdown of a note. Default cap 200 000 chars, `full: true` to disable. Extension whitelist: `.md`, `.markdown`, `.canvas`. |
+| `get_block_content` | Markdown of a single heading-scoped block (`block_key` or `{path, heading}`). On exact miss retries with a whitespace/case-insensitive normalization and reports the canonical key via `warnings`. |
 | `resolve_link` | Parse `[[Note#Heading]]` or `obsidian://` URIs to `{path, heading?}`. Does not read the file. |
 | `get_stats` | Active model, detected dims, counts, vault info, load statistics. |
 
@@ -117,7 +151,21 @@ npm run watch          # tsc --watch
 TEST_VAULT_PATH=/abs/path/to/vault npm run smoke
 ```
 
-`test-bge-m3.mjs` is a 60-check integration smoke test. It requires a Smart-Connections-indexed vault; all Ollama-specific checks are skipped gracefully if no endpoint is reachable.
+`test-bge-m3.mjs` is a 70+ integration smoke test. It requires a Smart-Connections-indexed vault; all Ollama-specific checks are skipped gracefully if no endpoint is reachable.
+
+## Agent skill
+
+`.claude/skills/obsidian-knowledge-search/SKILL.md` is a Claude Code skill that teaches the agent how to call these tools effectively — how to read the response envelope, how to interpret the three block levels (`##` / `###` / `#{N}`), the different `similarity` scales across modes, and the post-processing outputs (`section_content`, `sibling_matches`, `rank_score`).
+
+To make the skill discoverable from any working directory, symlink it into your user-level skills dir:
+
+```bash
+ln -s \
+  "$(pwd)/.claude/skills/obsidian-knowledge-search" \
+  ~/.claude/skills/obsidian-knowledge-search
+```
+
+The file stays versioned with the repo; the symlink is a local convenience.
 
 ## Security notes
 

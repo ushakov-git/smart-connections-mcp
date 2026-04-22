@@ -1,6 +1,96 @@
 
 # Changelog
 
+## v2.2.0 — 2026-04-22
+
+Incremental. No breaking changes to existing fields; additive only.
+Focused on closing the agent-UX gap surfaced by live testing: block
+hits were technically correct but the payload was too shallow, and
+the hybrid similarity scale confused consumers.
+
+### Search post-processing
+
+- **`expand_to_section` (new parameter, default `"high-similarity"`).**
+  Block-level hits are now auto-enriched with full parent-section
+  markdown in `section_content`, plus `section_heading` /
+  `section_lines` / `expansion`. Triggers:
+  - heading ends with `#{N}` fragment suffix (always expand — those
+    are topic-phrases without enough content in the excerpt);
+  - cosine similarity ≥ `expand_threshold` (default 0.8);
+  - mode `"always"` forces expansion on every block hit.
+  In hybrid mode the expand decision uses the pre-fusion cosine, not
+  the RRF score — so `0.8` remains cosine-native across modes.
+  Section content is capped by `expand_max_chars` (default 5000),
+  with `expansion.truncated_to_max_chars` surfacing the truncation.
+- **`deduplicate_by_section` (new parameter, default `true`).**
+  Block-level hits that share the first N heading segments (N=2 by
+  default, 3 also supported via `dedup_level`) are collapsed: the
+  best-similarity hit is kept; dropped siblings move into its
+  `sibling_matches`. Fixes the common case where top-5 is four slots
+  from the same `##`-section.
+- **Parent-block lookup** walks the heading chain by peeling the
+  trailing `#segment` (or `#{N}`) off the compound key and probing
+  the block index until a known ancestor is found.
+
+### Hybrid scoring
+
+- **`rank_score` and `raw_rrf_score` (new fields, hybrid-only).**
+  The raw RRF score lives in an awkward ~0.005–0.02 range and was
+  misread by agents as "low confidence". Every hybrid hit now also
+  carries `rank_score` (RRF divided by top-1 RRF in the response, so
+  top-1 is 1.0 and the scale is hybrid-native) and `raw_rrf_score`
+  for diagnostic clarity. `similarity` is unchanged for back-compat.
+
+### Fuzzy heading lookup
+
+- **`get_block_content` and `search_blocks`** now retry on exact
+  miss using a whitespace- and case-insensitive normalization scoped
+  to the note's blocks. On single-match resolution the response
+  carries the canonical key and `warnings: ["fuzzy-matched: ..."]`.
+  Ambiguous matches throw with the candidate list so the agent can
+  disambiguate instead of the server silently picking one. Fixes the
+  recurring "search_notes emits a heading, search_blocks can't find
+  it" failure.
+
+### Defaults and limits
+
+- Default `excerpt_chars` **500 → 1500**. On typical `##`-blocks of
+  3–6k characters, 500 covered 8–16 %; 1500 reaches 25–50 %.
+- `MAX_NOTE_CONTENT_CHARS` cap **100 000 → 200 000**. Long
+  reference notes commonly exceed 100k; `full: true` still disables
+  the cap entirely.
+
+### Descriptions
+
+- `search_notes` description now warns that in hybrid mode
+  `similarity` is an RRF score (~0.01), not cosine, and that
+  `threshold` applies pre-fusion to the semantic component only.
+- `get_note_content` description emphasizes checking `meta.truncated`
+  and using `full: true` for long notes.
+- `get_block_content` description mentions the fuzzy-lookup fallback.
+
+### New meta fields
+
+- `meta.expansion` — `{ mode, threshold, max_chars, applied_count,
+  skipped_count }` when the expand pass ran.
+- `meta.dedup` — `{ enabled, level, groups_collapsed }` when dedup
+  ran.
+
+### Skill
+
+- `.claude/skills/obsidian-knowledge-search/SKILL.md` — a Claude Code
+  agent skill that documents the 9-tool surface, the three block
+  levels, similarity scales, post-processing semantics, and four
+  worked examples. Symlink into `~/.claude/skills/` to make it
+  visible from any cwd (instructions in README).
+
+### Tests
+
+Smoke suite grew from **63** to **73** assertions, covering
+fragment auto-expand, expand "never" pass-through, dedup sibling
+collapsing, hybrid `rank_score` normalization, and fuzzy heading
+resolution.
+
 ## v2.1.0 — 2026-04-22
 
 Incremental. No breaking changes.
