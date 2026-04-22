@@ -140,12 +140,23 @@ const DEFAULT_EXPAND_THRESHOLD = 0.8;
 const DEFAULT_EXPAND_MAX_CHARS = 5_000;
 
 // Post-processing knobs shared by every search tool that returns ranked hits.
+const DEFAULT_INCLUDE_BLOCKS_LIST_SEARCH = false;
+const DEFAULT_MAX_BLOCKS_PER_HIT = 30;
+const MAX_BLOCKS_PER_HIT_CAP = 500;
 const PostProcessShape = {
   expand_to_section: ExpandMode.default('high-similarity'),
   expand_threshold: z.number().min(0).max(1).default(DEFAULT_EXPAND_THRESHOLD),
   expand_max_chars: z.number().int().positive().max(EXPAND_MAX_CHARS_CAP).default(DEFAULT_EXPAND_MAX_CHARS),
   deduplicate_by_section: z.boolean().default(true),
   dedup_level: DedupLevel.default(2),
+} as const;
+
+// Extra knobs for tools whose granularity can be `note` — these shape the
+// optional `blocks[]` list attached to note-level hits. Irrelevant for
+// block-only tools (`search_blocks`), so kept separate.
+const NoteHitBlocksShape = {
+  include_blocks_list: z.boolean().default(DEFAULT_INCLUDE_BLOCKS_LIST_SEARCH),
+  max_blocks_per_hit: z.number().int().positive().max(MAX_BLOCKS_PER_HIT_CAP).default(DEFAULT_MAX_BLOCKS_PER_HIT),
 } as const;
 
 const GetSimilarNotesSchema = z.object({
@@ -156,6 +167,7 @@ const GetSimilarNotesSchema = z.object({
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
   ...PostProcessShape,
+  ...NoteHitBlocksShape,
 });
 
 const SearchBlocksSchema = z.object({
@@ -183,6 +195,7 @@ const SearchNotesSchema = z.object({
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
   ...PostProcessShape,
+  ...NoteHitBlocksShape,
 });
 
 const GetEmbeddingNeighborsSchema = z.object({
@@ -193,12 +206,17 @@ const GetEmbeddingNeighborsSchema = z.object({
   include_excerpt: z.boolean().default(true),
   excerpt_chars: z.number().int().positive().max(MAX_EXCERPT_CHARS_CAP).default(DEFAULT_EXCERPT_CHARS),
   ...PostProcessShape,
+  ...NoteHitBlocksShape,
 });
 
+const DEFAULT_MAX_BLOCKS_IN_NOTE_CONTENT = 150;
+const MAX_BLOCKS_IN_NOTE_CONTENT_CAP = 2_000;
 const GetNoteContentSchema = z.object({
   note_path: z.string().min(1).max(1024),
   include_blocks: z.array(z.string()).optional(),
   full: z.boolean().default(false),
+  include_blocks_list: z.boolean().default(true),
+  max_blocks: z.number().int().positive().max(MAX_BLOCKS_IN_NOTE_CONTENT_CAP).default(DEFAULT_MAX_BLOCKS_IN_NOTE_CONTENT),
 });
 
 const GetBlockContentSchema = z
@@ -260,6 +278,20 @@ const postProcessJsonSchema = {
     default: 2,
     description:
       'Heading level used as the dedup key. 2 groups by "##" (default — widest coverage); 3 groups by "###" (finer; dedups only inside the same subsection).',
+  },
+  include_blocks_list: {
+    type: 'boolean',
+    default: DEFAULT_INCLUDE_BLOCKS_LIST_SEARCH,
+    description:
+      'Attach the full heading-key list (`blocks[]`) to note-granularity hits. Default false — a single large note can carry hundreds of keys that dominate the response size and push the reply past the MCP client token limit. Set to true only when you need the list (for example to enumerate subsections before deciding which `get_block_content` to call).',
+  },
+  max_blocks_per_hit: {
+    type: 'number',
+    minimum: 1,
+    maximum: MAX_BLOCKS_PER_HIT_CAP,
+    default: DEFAULT_MAX_BLOCKS_PER_HIT,
+    description:
+      'Upper bound on the `blocks[]` list attached to each note-granularity hit when `include_blocks_list: true`. Extra keys are dropped; `blocks_truncated: true` and `total_blocks_in_note` are set so the agent can fetch the full list via `get_note_content` if needed.',
   },
 } as const;
 
@@ -367,7 +399,7 @@ const tools: Tool[] = [
   {
     name: 'get_note_content',
     description:
-      `Retrieve a note's markdown. By default the response is capped at ${MAX_NOTE_CONTENT_CHARS} characters and the meta reports \`truncated: true\` when that happens; always check that flag. For long notes (content-heavy reference material, curriculum, long-form research) pass \`full: true\` to disable the cap and receive the complete text — there is no security risk beyond what the path-containment guard already blocks.`,
+      `Retrieve a note's markdown. By default the response is capped at ${MAX_NOTE_CONTENT_CHARS} characters and the meta reports \`truncated: true\` when that happens; always check that flag. For long notes (content-heavy reference material, curriculum, long-form research) pass \`full: true\` to disable the cap and receive the complete text — there is no security risk beyond what the path-containment guard already blocks.\n\nThe heading-key list \`blocks[]\` is attached by default (capped at \`max_blocks\` entries). On huge notes with hundreds of headings the list alone can push the JSON reply past the MCP client's token limit — pass \`include_blocks_list: false\` to drop the list and only receive \`total_blocks_in_note\`, or lower \`max_blocks\`.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -381,6 +413,20 @@ const tools: Tool[] = [
           type: 'boolean',
           default: false,
           description: `Disable the ${MAX_NOTE_CONTENT_CHARS}-character cap. Use when the note is known or expected to be long.`,
+        },
+        include_blocks_list: {
+          type: 'boolean',
+          default: true,
+          description:
+            'Attach `blocks[]` (heading-key list) to the response. Default true for back-compat. On huge notes (hundreds of headings) set to false to keep the reply within the client token limit — `total_blocks_in_note` is still returned.',
+        },
+        max_blocks: {
+          type: 'number',
+          minimum: 1,
+          maximum: MAX_BLOCKS_IN_NOTE_CONTENT_CAP,
+          default: DEFAULT_MAX_BLOCKS_IN_NOTE_CONTENT,
+          description:
+            'Upper bound on `blocks[]` length when `include_blocks_list: true`. Extra keys are dropped; `blocks_truncated: true` and `total_blocks_in_note` report the truncation.',
         },
       },
       required: ['note_path'],
@@ -455,6 +501,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           expand_max_chars: p.expand_max_chars,
           deduplicate_by_section: p.deduplicate_by_section,
           dedup_level: p.dedup_level,
+          include_blocks_list: p.include_blocks_list,
+          max_blocks_per_hit: p.max_blocks_per_hit,
         });
         return ok({ meta: baseMetaWithPostProcess(results, p), results });
       }
@@ -500,6 +548,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           expand_max_chars: p.expand_max_chars,
           deduplicate_by_section: p.deduplicate_by_section,
           dedup_level: p.dedup_level,
+          include_blocks_list: p.include_blocks_list,
+          max_blocks_per_hit: p.max_blocks_per_hit,
         });
         return ok({
           meta: {
@@ -523,20 +573,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           expand_max_chars: p.expand_max_chars,
           deduplicate_by_section: p.deduplicate_by_section,
           dedup_level: p.dedup_level,
+          include_blocks_list: p.include_blocks_list,
+          max_blocks_per_hit: p.max_blocks_per_hit,
         });
         return ok({ meta: baseMetaWithPostProcess(results, p), results });
       }
 
       case 'get_note_content': {
         const p = GetNoteContentSchema.parse(args);
-        const result = searchEngine.getNoteWithContext(p.note_path, p.include_blocks ?? []);
+        const result = searchEngine.getNoteWithContext(p.note_path, p.include_blocks ?? [], {
+          include_blocks_list: p.include_blocks_list,
+          max_blocks: p.max_blocks,
+        });
         const capped = !p.full && result.content.length > MAX_NOTE_CONTENT_CHARS;
         const content = capped ? result.content.slice(0, MAX_NOTE_CONTENT_CHARS) : result.content;
         return ok({
           meta: { ...baseMeta(), truncated: capped, original_length: result.content.length },
           path: result.path,
           content,
-          blocks: result.blocks,
+          ...(result.blocks !== undefined ? { blocks: result.blocks } : {}),
+          ...(result.blocks_truncated !== undefined ? { blocks_truncated: result.blocks_truncated } : {}),
+          ...(result.total_blocks_in_note !== undefined ? { total_blocks_in_note: result.total_blocks_in_note } : {}),
         });
       }
 

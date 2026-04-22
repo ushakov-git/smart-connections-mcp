@@ -116,8 +116,17 @@ export interface ResultRef {
 
 export interface SimilarNote extends ResultRef {
   similarity: number;
-  /** Heading list for a note-level hit (block names available under this note). */
+  /**
+   * Heading list for a note-level hit (block names available under this note).
+   * Opt-in via `include_blocks_list: true` — by default omitted to keep
+   * note-granularity responses compact (a single large note can carry
+   * hundreds of heading keys).
+   */
   blocks?: string[];
+  /** True if `blocks` was truncated to `max_blocks_per_hit` items. */
+  blocks_truncated?: boolean;
+  /** Total headings available for the note, independent of truncation. */
+  total_blocks_in_note?: number;
   /** Leading substring of the referenced block/note content. */
   excerpt?: string;
   /** True if the excerpt was truncated. */
@@ -191,5 +200,14 @@ export interface ConnectionGraph {
 export interface NoteContent {
   path: string;
   content: string;
-  blocks: string[];
+  /**
+   * Heading keys for the note. Opt-out via `include_blocks_list: false`
+   * on `get_note_content`; truncated to `max_blocks` when the note has
+   * more than that (flagged through `blocks_truncated`).
+   */
+  blocks?: string[];
+  /** True if `blocks` was truncated to `max_blocks` items. */
+  blocks_truncated?: boolean;
+  /** Total number of heading keys the note contains. */
+  total_blocks_in_note?: number;
 }

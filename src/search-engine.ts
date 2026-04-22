@@ -63,6 +63,21 @@ export interface SearchOptions extends HitPostProcessOptions {
   granularity?: Granularity;
   include_excerpt?: boolean;
   excerpt_chars?: number;
+  /**
+   * Whether note-granularity hits should carry the full `blocks[]` list
+   * of heading keys for the matched note. Defaults to `false` in search
+   * results — a single large note can contribute tens of kilobytes of
+   * heading keys that dominate the response size. Agents that actually
+   * need the list should request it explicitly.
+   */
+  include_blocks_list?: boolean;
+  /**
+   * Cap on `blocks[]` length per hit when `include_blocks_list` is true.
+   * Extra keys are dropped; `blocks_truncated: true` and
+   * `total_blocks_in_note` are set so the agent can decide to fetch the
+   * full list via `get_note_content`.
+   */
+  max_blocks_per_hit?: number;
 }
 
 const DEFAULT_EXCERPT_CHARS = 1_500;
@@ -72,6 +87,9 @@ const DEFAULT_DEDUP_LEVEL: 2 | 3 = 2;
 const DEFAULT_EXPAND_MODE: ExpandMode = 'high-similarity';
 const DEFAULT_DEDUP_ENABLED = true;
 const DEDUP_FETCH_MULTIPLIER = 3;
+const DEFAULT_INCLUDE_BLOCKS_LIST_IN_SEARCH = false;
+const DEFAULT_MAX_BLOCKS_PER_HIT = 30;
+const DEFAULT_MAX_BLOCKS_IN_NOTE_CONTENT = 150;
 
 /**
  * Tunable parameters of the hybrid Reciprocal Rank Fusion step.
@@ -160,6 +178,8 @@ export class SearchEngine {
       granularity,
       include_excerpt: opts.include_excerpt ?? true,
       excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
+      include_blocks_list: opts.include_blocks_list ?? DEFAULT_INCLUDE_BLOCKS_LIST_IN_SEARCH,
+      max_blocks_per_hit: opts.max_blocks_per_hit ?? DEFAULT_MAX_BLOCKS_PER_HIT,
       excludePath: notePath,
     });
     return this.postProcessHits(raw, limit, { ...opts, granularity });
@@ -220,6 +240,8 @@ export class SearchEngine {
       granularity,
       include_excerpt: opts.include_excerpt ?? true,
       excerpt_chars: opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS,
+      include_blocks_list: opts.include_blocks_list ?? DEFAULT_INCLUDE_BLOCKS_LIST_IN_SEARCH,
+      max_blocks_per_hit: opts.max_blocks_per_hit ?? DEFAULT_MAX_BLOCKS_PER_HIT,
     });
     return this.postProcessHits(raw, k, { ...opts, granularity });
   }
@@ -245,6 +267,8 @@ export class SearchEngine {
       granularity?: Granularity;
       include_excerpt?: boolean;
       excerpt_chars?: number;
+      include_blocks_list?: boolean;
+      max_blocks_per_hit?: number;
     } & HitPostProcessOptions = {},
   ): Promise<{ results: SimilarNote[]; mode: SearchMode; fallback_from?: SearchMode; warnings: string[] }> {
     const mode: SearchMode = opts.mode ?? (this.ollama ? 'hybrid' : 'keyword');
@@ -253,21 +277,23 @@ export class SearchEngine {
     const granularity: Granularity = opts.granularity ?? 'block';
     const include_excerpt = opts.include_excerpt ?? true;
     const excerpt_chars = opts.excerpt_chars ?? DEFAULT_EXCERPT_CHARS;
+    const include_blocks_list = opts.include_blocks_list ?? DEFAULT_INCLUDE_BLOCKS_LIST_IN_SEARCH;
+    const max_blocks_per_hit = opts.max_blocks_per_hit ?? DEFAULT_MAX_BLOCKS_PER_HIT;
     const warnings: string[] = [];
 
     if ((mode === 'semantic' || mode === 'hybrid') && !this.ollama) {
       if (mode === 'semantic') {
         warnings.push('semantic requested but Ollama is not configured — falling back to keyword.');
-        const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+        const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold, { include_blocks_list, max_blocks_per_hit });
         return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode: 'keyword', fallback_from: 'semantic', warnings };
       }
       warnings.push('hybrid requested but Ollama is not configured — using keyword only.');
-      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold, { include_blocks_list, max_blocks_per_hit });
       return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode: 'keyword', fallback_from: 'hybrid', warnings };
     }
 
     if (mode === 'keyword') {
-      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold, { include_blocks_list, max_blocks_per_hit });
       return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode, warnings };
     }
 
@@ -278,7 +304,7 @@ export class SearchEngine {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       warnings.push(`Ollama embed failed: ${msg} — falling back to keyword.`);
-      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold);
+      const kw = this.searchKeyword(queryText, overFetchLimit(limit, granularity, opts), threshold, { include_blocks_list, max_blocks_per_hit });
       return { results: this.postProcessHits(kw, limit, { ...opts, granularity }), mode: 'keyword', fallback_from: mode, warnings };
     }
 
@@ -291,6 +317,8 @@ export class SearchEngine {
       granularity,
       include_excerpt,
       excerpt_chars,
+      include_blocks_list,
+      max_blocks_per_hit,
     });
 
     if (mode === 'semantic') {
@@ -335,7 +363,14 @@ export class SearchEngine {
   }
 
   /** Substring-frequency scorer. Note-level only. */
-  private searchKeyword(queryText: string, limit: number, threshold: number): SimilarNote[] {
+  private searchKeyword(
+    queryText: string,
+    limit: number,
+    threshold: number,
+    opts: { include_blocks_list?: boolean; max_blocks_per_hit?: number } = {},
+  ): SimilarNote[] {
+    const include_blocks_list = opts.include_blocks_list ?? DEFAULT_INCLUDE_BLOCKS_LIST_IN_SEARCH;
+    const max_blocks_per_hit = opts.max_blocks_per_hit ?? DEFAULT_MAX_BLOCKS_PER_HIT;
     const results: SimilarNote[] = [];
     const queryLower = queryText.toLowerCase();
     const re = new RegExp(escapeRegex(queryLower), 'gi');
@@ -347,12 +382,23 @@ export class SearchEngine {
         if (matches > 0) {
           const score = Math.min(matches / 10, 1.0);
           if (score >= threshold) {
-            results.push({
+            const hit: SimilarNote = {
               path: p,
               similarity: score,
-              blocks: Object.keys(source.blocks || {}),
               vault_name: this.vaultName,
-            });
+            };
+            if (include_blocks_list) {
+              const all = Object.keys(source.blocks || {});
+              hit.total_blocks_in_note = all.length;
+              if (all.length > max_blocks_per_hit) {
+                hit.blocks = all.slice(0, max_blocks_per_hit);
+                hit.blocks_truncated = true;
+              } else {
+                hit.blocks = all;
+                hit.blocks_truncated = false;
+              }
+            }
+            results.push(hit);
           }
         }
       } catch {
@@ -366,11 +412,35 @@ export class SearchEngine {
   // Content access
   // -----------------------------------------------------------------
 
-  getNoteWithContext(notePath: string, _includeBlocks: string[] = []): NoteContent {
+  getNoteWithContext(
+    notePath: string,
+    _includeBlocks: string[] = [],
+    opts: { include_blocks_list?: boolean; max_blocks?: number } = {},
+  ): NoteContent {
+    const include_blocks_list = opts.include_blocks_list ?? true;
+    const max_blocks = opts.max_blocks ?? DEFAULT_MAX_BLOCKS_IN_NOTE_CONTENT;
     const content = this.loader.readNoteContent(notePath);
     const source = this.loader.getSource(notePath);
-    const availableBlocks = source ? Object.keys(source.blocks || {}) : [];
-    return { path: notePath, content, blocks: availableBlocks };
+    const all = source ? Object.keys(source.blocks || {}) : [];
+    if (!include_blocks_list) {
+      return { path: notePath, content, total_blocks_in_note: all.length };
+    }
+    if (all.length > max_blocks) {
+      return {
+        path: notePath,
+        content,
+        blocks: all.slice(0, max_blocks),
+        blocks_truncated: true,
+        total_blocks_in_note: all.length,
+      };
+    }
+    return {
+      path: notePath,
+      content,
+      blocks: all,
+      blocks_truncated: false,
+      total_blocks_in_note: all.length,
+    };
   }
 
   /**
@@ -529,11 +599,23 @@ export class SearchEngine {
       granularity: Granularity;
       include_excerpt: boolean;
       excerpt_chars: number;
+      include_blocks_list?: boolean;
+      max_blocks_per_hit?: number;
       excludePath?: string;
       excludeBlockKey?: string;
     },
   ): SimilarNote[] {
-    const { granularity, threshold, limit, include_excerpt, excerpt_chars, excludePath, excludeBlockKey } = opts;
+    const {
+      granularity,
+      threshold,
+      limit,
+      include_excerpt,
+      excerpt_chars,
+      include_blocks_list = DEFAULT_INCLUDE_BLOCKS_LIST_IN_SEARCH,
+      max_blocks_per_hit = DEFAULT_MAX_BLOCKS_PER_HIT,
+      excludePath,
+      excludeBlockKey,
+    } = opts;
 
     const items: Array<{ id: string; vec: number[]; meta: { type: 'note' | 'block'; source?: SmartSource; block?: SmartBlock } }> = [];
 
@@ -566,9 +648,19 @@ export class SearchEngine {
         const hit: SimilarNote = {
           path: src.path,
           similarity: n.similarity,
-          blocks: Object.keys(src.blocks || {}),
           vault_name: this.vaultName,
         };
+        if (include_blocks_list) {
+          const all = Object.keys(src.blocks || {});
+          hit.total_blocks_in_note = all.length;
+          if (all.length > max_blocks_per_hit) {
+            hit.blocks = all.slice(0, max_blocks_per_hit);
+            hit.blocks_truncated = true;
+          } else {
+            hit.blocks = all;
+            hit.blocks_truncated = false;
+          }
+        }
         if (include_excerpt) {
           const ex = this.noteExcerpt(src.path, excerpt_chars);
           if (ex) {
