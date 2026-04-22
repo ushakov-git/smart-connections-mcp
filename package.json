@@ -1,6 +1,6 @@
 {
   "name": "smart-connections-mcp",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "MCP server for Obsidian Smart Connections — block-level semantic search, Ollama-backed queries, hot reload.",
   "type": "module",
   "main": "dist/index.js",

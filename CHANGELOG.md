@@ -1,6 +1,36 @@
 
 # Changelog
 
+## v2.2.2 — 2026-04-23
+
+Patch release. Raises the `get_note_content` cap to fit 1M-context
+models (Opus 4.7). Additive; no breaking changes.
+
+### Changes
+
+- **Default `MAX_NOTE_CONTENT_CHARS`: 200 000 → 1 000 000 characters.**
+  Roughly 250–330k tokens of Cyrillic markdown — comfortably inside a
+  1M-token context window. `full: true` on `get_note_content` still
+  disables the cap entirely.
+- **New env `MAX_NOTE_CONTENT_CHARS`.** Configurable per-install,
+  range 1 000 – 50 000 000. Invalid values fall back to the default
+  and log a warning, matching the behaviour of the other env knobs.
+- Startup log reports the resolved cap and whether it came from env
+  or default, e.g.
+  `[smart-connections-mcp] note_content_cap=1000000 chars (default)`.
+
+### Independent from client token-limit
+
+The MCP client's own per-response token limit is a separate
+constraint and the server cannot influence it. If Claude Code (or
+any other client) truncates a response before the server cap would,
+raising `MAX_NOTE_CONTENT_CHARS` will not help. For that scenario:
+prefer `get_block_content` (section-level chunking via heading
+boundaries) or keep an eye on the v2.3.0 backlog where a
+`get_note_content_chunk` tool is tracked.
+
+---
+
 ## v2.2.1 — 2026-04-23
 
 Patch release driven by live testing on a real vault

@@ -123,7 +123,22 @@ console.error(
 
 // ---------------------------------------------------------------- limits
 
-const MAX_NOTE_CONTENT_CHARS = 200_000;
+// Cap on `get_note_content` payload (characters, not tokens). Default
+// 1,000,000 — roughly 250-330k tokens of Cyrillic markdown, which fits
+// inside Opus 4.7's 1M-token context. Raise or lower via env
+// `MAX_NOTE_CONTENT_CHARS`. `full: true` on the tool still disables the
+// cap entirely. Independent from the MCP client's own per-response token
+// limit, which the server cannot influence.
+const MAX_NOTE_CONTENT_CHARS = parseNum(
+  process.env.MAX_NOTE_CONTENT_CHARS,
+  1_000_000,
+  1_000,
+  50_000_000,
+);
+console.error(
+  `[smart-connections-mcp] note_content_cap=${MAX_NOTE_CONTENT_CHARS} chars` +
+    (process.env.MAX_NOTE_CONTENT_CHARS ? ' (from env)' : ' (default)'),
+);
 const MAX_EXCERPT_CHARS_CAP = 5_000;
 const DEFAULT_EXCERPT_CHARS = 1_500;
 const MAX_DEPTH = 4;

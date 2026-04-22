@@ -61,6 +61,7 @@ Register a separate MCP server per vault. `SMART_VAULT_NAME` is echoed in every 
 | `RRF_K` | Smoothing constant for hybrid RRF. Applied to both lists, so changing it does **not** shift the semantic/keyword balance — it only flattens the score curve. | 60 |
 | `RRF_SEMANTIC_WEIGHT` | Weight of the semantic ranked list in the fused score. Increase to let embeddings dominate. | 0.7 |
 | `RRF_KEYWORD_WEIGHT` | Weight of the keyword ranked list in the fused score. Increase for rare names/quotations/acronyms. | 0.3 |
+| `MAX_NOTE_CONTENT_CHARS` | Upper bound in characters on the `get_note_content` payload. `full: true` still disables the cap entirely. Range 1 000 – 50 000 000. | 1 000 000 (v2.2.2) |
 
 A `.env` file placed next to the server's cwd is auto-loaded. Values provided in the MCP client config always win.
 
@@ -141,7 +142,7 @@ The `meta` reports what the post-processor did: `meta.expansion = { mode, thresh
 | `search_notes` | Free-form query search. Modes: `semantic` (Ollama), `keyword` (substring), `hybrid` (RRF fusion). Default: hybrid when Ollama is available, else keyword. |
 | `get_embedding_neighbors` | Nearest neighbors for a raw vector. Must match the vault's active dims. |
 | `get_connection_graph` | Nested tree (and flat list) of semantically connected notes from a seed. |
-| `get_note_content` | Full markdown of a note. Default cap 200 000 chars, `full: true` to disable. Extension whitelist: `.md`, `.markdown`, `.canvas`. |
+| `get_note_content` | Full markdown of a note. Default cap **1 000 000 chars** (~250-330k tokens of Cyrillic markdown; v2.2.2 default, was 200 000). Override per-install via env `MAX_NOTE_CONTENT_CHARS`. `full: true` disables the cap entirely. Extension whitelist: `.md`, `.markdown`, `.canvas`. Independent from the MCP client's per-response token limit, which the server cannot influence. |
 | `get_block_content` | Markdown of a single heading-scoped block (`block_key` or `{path, heading}`). On exact miss retries with a whitespace/case-insensitive normalization and reports the canonical key via `warnings`. |
 | `resolve_link` | Parse `[[Note#Heading]]` or `obsidian://` URIs to `{path, heading?}`. Does not read the file. |
 | `get_stats` | Active model, detected dims, counts, vault info, load statistics. |
