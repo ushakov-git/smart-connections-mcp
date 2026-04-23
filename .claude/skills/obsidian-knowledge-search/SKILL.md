@@ -107,8 +107,8 @@ Smart Connections индексирует vault на двух уровнях:
     "model_key": "bge-m3:latest",
     "dims": 1024,
     "semantic_available": true,
-    "total_notes": 141,
-    "total_blocks": 11796,
+    "total_notes": 147,
+    "total_blocks": 12007,
     "execution_ms": 37,
     "fusion": { "k": 60, "semantic_weight": 0.7, "keyword_weight": 0.3 },
     // только для search_notes:
@@ -312,8 +312,7 @@ Smart Connections индексирует vault на двух уровнях:
 
 | Сообщение сервера | Причина | Что делать |
 |---|---|---|
-| `Block not found: <key>` | Ключ не существует в индексе. Заметка удалена/переименована; heading изменён | Проверить `get_stats`, `search_notes` по тексту раздела. Возможно Smart Connections ещё не переиндексировал — попросить пользователя запустить переиндексацию в Obsidian. |
-| `Block line range unknown for <key>` | Блок есть, но у него нет `lines` (это бывает для некоторых legacy-блоков) | Вернуть пользователю, что конкретный блок не имеет диапазона; использовать `get_note_content` на соответствующей заметке. |
+| `Block not found: <key>` | Ключ не найден ни точным совпадением, ни через fuzzy-lookup. Возможные причины: заметка удалена/переименована, heading изменён, опечатка, Smart Connections ещё не переиндексировал файл. С v2.2.1 это **единое** сообщение на любой miss (раньше встречалось также `Block line range unknown` — убрано). | Проверить `get_stats`, запустить `search_notes` по тексту раздела, попросить пользователя переиндексировать vault в Obsidian. |
 | `embedding_vector has N dims, expected M (model: ...)` | Ты передал неверный размерности вектор в `get_embedding_neighbors` | Получить `dims` через `get_stats` и подогнать вектор. |
 | `Note not found: <path>` | Путь неверный (опечатка, регистр, лишние слеши) | Проверить, как path выглядит в предыдущих ответах сервера — вайка-релативные пути с учётом регистра обязательны. |
 | `semantic requested but Ollama is not configured — falling back to keyword` | На сервере Ollama отсутствует или не проходит health-check | Предупредить пользователя: семантический поиск недоступен. Можно попросить проверить что Ollama запущен (`http://localhost:11434`). |
