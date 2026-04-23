@@ -98,51 +98,68 @@ Smart Connections индексирует vault на двух уровнях:
 
 ## 4. Формат ответа сервера
 
-Все поисковые инструменты возвращают JSON со структурой:
+Все поисковые инструменты возвращают JSON со структурой ниже. Пример взят с реального vault'а `Develop` — **конкретные значения-цифры иллюстративные**, skill универсален и применим к любому vault'у. Поля в ответе делятся на четыре категории (это важно для правильной интерпретации):
+
+| Категория | Что это | Примеры полей | Как меняется |
+|---|---|---|---|
+| **vault-specific** | Свойства конкретной установки Smart Connections | `meta.vault_name`, `meta.model_key`, `meta.dims`, `meta.total_notes`, `meta.total_blocks` | От vault к vault. В примере ниже показаны значения для `Develop`. В твоём vault'е будут другие. |
+| **server-default** | Константы сервера — переопределяются env-переменными (`RRF_K`, `RRF_SEMANTIC_WEIGHT`, `RRF_KEYWORD_WEIGHT`, `MAX_NOTE_CONTENT_CHARS`) либо параметрами самого tool'а (`expand_threshold`, `expand_max_chars`, `dedup_level` и т.д.) | `meta.fusion.{k, semantic_weight, keyword_weight}`, `meta.expansion.{mode, threshold, max_chars}`, `meta.dedup.level` | Фиксированы на всю сессию. В примере показаны дефолты из кода. |
+| **per-request** | Меняется при каждом вызове, отражает выдачу | `meta.execution_ms`, `meta.expansion.applied_count`, `meta.expansion.skipped_count`, `meta.dedup.groups_collapsed`, весь `results[]` | Каждый вызов даёт свои значения. |
+| **state** | Отражает текущее состояние сервера | `meta.semantic_available`, `meta.search_mode`, `meta.fallback_from`, `meta.warnings` | Обычно стабильно в рамках сессии (может смениться на fallback при ошибке Ollama). |
+
+Когда видишь цифру в конкретном ответе — сначала определи её категорию, только потом решай, можно ли на неё опираться как на стабильный параметр.
 
 ```jsonc
 {
   "meta": {
-    "vault_name": "Develop",
-    "model_key": "bge-m3:latest",
-    "dims": 1024,
-    "semantic_available": true,
-    "total_notes": 147,
-    "total_blocks": 12007,
-    "execution_ms": 37,
-    "fusion": { "k": 60, "semantic_weight": 0.7, "keyword_weight": 0.3 },
+    "vault_name": "Develop",              // vault-specific (пример)
+    "model_key": "bge-m3:latest",         // vault-specific (пример)
+    "dims": 1024,                          // vault-specific (пример)
+    "semantic_available": true,            // state
+    "total_notes": 147,                    // vault-specific (пример)
+    "total_blocks": 12007,                 // vault-specific (пример)
+    "execution_ms": 37,                    // per-request
+    "fusion": {
+      "k": 60,                             // server-default (env RRF_K)
+      "semantic_weight": 0.7,              // server-default (env RRF_SEMANTIC_WEIGHT)
+      "keyword_weight": 0.3                // server-default (env RRF_KEYWORD_WEIGHT)
+    },
     // только для search_notes:
-    "search_mode": "hybrid",
-    "fallback_from": null,
-    "warnings": [],
+    "search_mode": "hybrid",               // state
+    "fallback_from": null,                 // state
+    "warnings": [],                        // state
     // когда expand применено:
     "expansion": {
-      "mode": "high-similarity",
-      "threshold": 0.8,
-      "max_chars": 5000,
-      "applied_count": 3,
-      "skipped_count": 2
+      "mode": "high-similarity",           // server-default (tool param expand_to_section)
+      "threshold": 0.8,                    // server-default (tool param expand_threshold)
+      "max_chars": 5000,                   // server-default (tool param expand_max_chars)
+      "applied_count": 3,                  // per-request
+      "skipped_count": 2                   // per-request
     },
     // когда dedup включено:
-    "dedup": { "enabled": true, "level": 2, "groups_collapsed": 4 }
+    "dedup": {
+      "enabled": true,                     // state (по умолчанию true)
+      "level": 2,                          // server-default (tool param dedup_level)
+      "groups_collapsed": 4                // per-request
+    }
   },
   "results": [
     {
-      "path": "01 MASTRA/Mastra 4- Память.md",
-      "heading": "##Структурированная Working Memory#{1}",
-      "lines": [1071, 1195],
-      "similarity": 0.87,               // cosine (или RRF в hybrid)
-      "excerpt": "...",                 // обрезано до excerpt_chars (дефолт 1500)
-      "excerpt_truncated": true,
-      "vault_name": "Develop",
+      "path": "01 MASTRA/Mastra 4- Память.md",                  // per-request (пример)
+      "heading": "##Структурированная Working Memory#{1}",      // per-request (пример)
+      "lines": [1071, 1195],                                     // per-request (пример)
+      "similarity": 0.87,                                        // per-request, cosine (или RRF в hybrid)
+      "excerpt": "...",                                          // per-request, до excerpt_chars (дефолт 1500)
+      "excerpt_truncated": true,                                 // per-request
+      "vault_name": "Develop",                                   // vault-specific (пример)
 
       // появляются если сервер применил expand-to-section:
-      "section_content": "...",         // ПОЛНЫЙ markdown родительского раздела
-      "section_heading": "##Структурированная Working Memory",
-      "section_lines": [1050, 1280],
+      "section_content": "...",                                  // per-request — полный markdown родителя
+      "section_heading": "##Структурированная Working Memory",   // per-request (пример)
+      "section_lines": [1050, 1280],                             // per-request (пример)
       "expansion": {
-        "applied": true,
-        "reason": "fragment auto-expand",
+        "applied": true,                                         // per-request
+        "reason": "fragment auto-expand",                        // per-request (одно из перечисления)
         "original_heading": "##Структурированная Working Memory#{1}",
         "truncated_to_max_chars": false
       },
@@ -153,8 +170,8 @@ Smart Connections индексирует vault на двух уровнях:
       ],
 
       // только в hybrid:
-      "rank_score": 1.0,
-      "raw_rrf_score": 0.0164
+      "rank_score": 1.0,                   // per-request, [0,1], top-1 = 1.0
+      "raw_rrf_score": 0.0164              // per-request
     }
   ]
 }
