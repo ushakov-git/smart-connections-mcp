@@ -40,3 +40,11 @@ coverage/
 # Temporary files
 tmp/
 temp/
+
+# Claude
+CLAUDE.md
+.claude/
+.memory-system/
+
+# Test reports
+test-reports/
