@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "smart-connections-develop": {
+      "command": "node",
+      "args": [
+        "/Users/evgeny/Dropbox/4-Base-of-Skills/9-Instrumental-skills/Obsidian/mcp-to-obsidian-smart-connection/smart-connections-mcp/dist/index.js"
+      ],
+      "env": {
+        "SMART_VAULT_PATH": "/Users/evgeny/Dropbox/8 SecondBrain/OBSIDIAN-NOTION/Develop/Develop",
+        "SMART_VAULT_NAME": "Develop",
+        "OLLAMA_HOST": "http://127.0.0.1:11434",
+        "OLLAMA_EMBED_MODEL": "bge-m3:latest",
+        "RRF_K": "60",
+        "RRF_SEMANTIC_WEIGHT": "0.7",
+        "RRF_KEYWORD_WEIGHT": "0.3",
+        "MAX_NOTE_CONTENT_CHARS": "1000000"
+      }
+    }
+  }
+}
